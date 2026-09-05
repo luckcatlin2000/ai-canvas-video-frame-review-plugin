@@ -26,7 +26,7 @@
   ],
   "ui": {
     "entry": "ui.js",
-    "integrity": "sha256-af17f3326d6a59e4511a973ef655973a6503e33bc4f87f483d57c912bb7b3820",
+    "integrity": "sha256-a10f6ee7f86f8dcb8c268a9b8101cfcb3773cf649c4edd98f2d113c370469bd7",
     "exports": {
       "frameReview": "VideoFrameReview"
     }

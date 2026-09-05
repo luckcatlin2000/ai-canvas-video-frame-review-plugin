@@ -1,5 +1,6 @@
 const MAX_FRAME_COUNT = 24;
 const FRAME_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ANALYSIS_FIELDS = ['shotSize', 'camera', 'content', 'dialogue', 'audio', 'transition', 'note'];
 
 function asFiniteNumber(value, fallback) {
   const number = Number(value);
@@ -43,6 +44,26 @@ function normalizeFrames(parameters) {
     const frameDuration = Math.max(0, asFiniteNumber(rawFrame.frameDuration, 0));
     const width = Math.max(1, Math.round(asFiniteNumber(rawFrame.width, 1)));
     const height = Math.max(1, Math.round(asFiniteNumber(rawFrame.height, 1)));
+    const shotId = rawFrame.shotId;
+    const inPoint = rawFrame.inPoint;
+    const outPoint = rawFrame.outPoint;
+    if (typeof shotId !== 'string' || !FRAME_KEY_PATTERN.test(shotId)
+      || ![inPoint, outPoint].every((value) => typeof value === 'number' && Number.isFinite(value))
+      || inPoint < 0 || outPoint <= inPoint || outPoint > parameters.videoDuration
+      || requestedTime < inPoint || requestedTime >= outPoint) throw new Error('镜头 ID、入出点或代表帧无效');
+    if (index > 0 && inPoint < rawFrames[index - 1].outPoint) throw new Error('镜头区间不能重叠或倒序');
+    if (rawFrames.slice(0, index).some((frame) => frame.shotId === shotId)) throw new Error('镜头 ID 重复');
+    if (rawFrame.analysisError || rawFrame.reviewStatus === 'edited') throw new Error('请先确认缺失结果和人工修改的复核状态');
+    const overrideFields = Array.isArray(rawFrame.overrideFields)
+      ? [...new Set(rawFrame.overrideFields.filter((field) => ANALYSIS_FIELDS.includes(field)))] : [];
+    const aiOriginal = {};
+    if (rawFrame.aiOriginal && typeof rawFrame.aiOriginal === 'object') {
+      ANALYSIS_FIELDS.forEach((field) => {
+        if (typeof rawFrame.aiOriginal[field] === 'string') aiOriginal[field] = rawFrame.aiOriginal[field].slice(0, field === 'content' ? 2000 : 1000);
+      });
+      aiOriginal.confidence = typeof rawFrame.aiOriginal.confidence === 'number' && Number.isFinite(rawFrame.aiOriginal.confidence)
+        ? Math.max(0, Math.min(1, rawFrame.aiOriginal.confidence)) : null;
+    }
     return {
       key,
       resourceId,
@@ -51,34 +72,30 @@ function normalizeFrames(parameters) {
       frameDuration,
       width,
       height,
+      shotId, inPoint, outPoint,
+      sampleRole: ['start', 'middle', 'end', 'custom'].includes(rawFrame.sampleRole) ? rawFrame.sampleRole : 'custom',
+      reviewStatus: rawFrame.reviewStatus === 'reviewed' ? 'reviewed' : 'unreviewed',
+      overrideFields, aiOriginal,
       shotSize: cleanText(rawFrame.shotSize, '未标注', 80),
       camera: cleanText(rawFrame.camera, '未标注', 240),
       content: cleanText(rawFrame.content, '未返回分析', 2000),
       dialogue: cleanText(rawFrame.dialogue, '无法从画面判断', 1000),
       audio: cleanText(rawFrame.audio, '无法从画面判断', 1000),
       transition: cleanText(rawFrame.transition, '切', 80),
-      duration: Math.max(0, asFiniteNumber(rawFrame.duration, 0)),
+      duration: outPoint - inPoint,
       note: cleanText(rawFrame.note, '', 1000),
-      confidence: Math.max(0, Math.min(1, asFiniteNumber(rawFrame.confidence, 0))),
+      confidence: typeof rawFrame.confidence === 'number' && Number.isFinite(rawFrame.confidence)
+        ? Math.max(0, Math.min(1, rawFrame.confidence)) : null,
       analysisError: cleanText(rawFrame.analysisError, '', 240),
     };
   });
 }
 
-function resolvedDuration(frames, index, videoDuration) {
-  const frame = frames[index];
-  if (frame.duration > 0) return Math.min(frame.duration, 3600);
-  const next = frames[index + 1];
-  if (next && next.actualTime > frame.actualTime) return Math.max(0.04, next.actualTime - frame.actualTime);
-  if (videoDuration > frame.actualTime) return Math.max(0.04, videoDuration - frame.actualTime);
-  return Math.max(0.04, frame.frameDuration || 1);
-}
-
 function buildNodeSet(parameters) {
+  if (!Number.isFinite(parameters.videoDuration) || parameters.videoDuration <= 0) throw new Error('来源视频时长无效');
   const frames = normalizeFrames(parameters);
   const outputMode = parameters.outputMode === 'images' ? 'images' : 'shotlist';
-  const videoDuration = Math.max(0, asFiniteNumber(parameters.videoDuration, 0));
-  const imageNodes = frames.map((frame, index) => ({
+  const imageNodes = frames.map((frame) => ({
     key: frame.key,
     nodeType: 'ai-image',
     resourceId: frame.resourceId,
@@ -87,6 +104,13 @@ function buildNodeSet(parameters) {
       imageWidth: frame.width,
       imageHeight: frame.height,
       frameAnalysis: {
+        shotId: frame.shotId,
+        inPoint: frame.inPoint,
+        outPoint: frame.outPoint,
+        sampleRole: frame.sampleRole,
+        reviewStatus: frame.reviewStatus,
+        overrideFields: frame.overrideFields,
+        aiOriginal: frame.aiOriginal,
         requestedTime: frame.requestedTime,
         actualTime: frame.actualTime,
         frameDuration: frame.frameDuration,
@@ -96,7 +120,7 @@ function buildNodeSet(parameters) {
         dialogue: frame.dialogue,
         audio: frame.audio,
         transition: frame.transition,
-        duration: resolvedDuration(frames, index, videoDuration),
+        duration: frame.duration,
         note: frame.analysisError ? `${frame.note ? `${frame.note}；` : ''}${frame.analysisError}` : frame.note,
         confidence: frame.confidence,
       },
@@ -107,7 +131,7 @@ function buildNodeSet(parameters) {
 
   const shotlistKey = 'shotlist';
   const shotlistRows = frames.map((frame, index) => ({
-    id: `shot-${index + 1}`,
+    id: frame.shotId,
     shotNo: String(index + 1),
     frameKey: frame.key,
     shotSize: frame.shotSize,
@@ -116,7 +140,8 @@ function buildNodeSet(parameters) {
     dialogue: frame.dialogue,
     audio: frame.audio,
     transition: frame.transition,
-    duration: resolvedDuration(frames, index, videoDuration),
+    duration: frame.duration,
+    frameAnalysis: imageNodes[index].data.frameAnalysis,
     note: frame.analysisError ? `${frame.note ? `${frame.note}；` : ''}${frame.analysisError}` : frame.note,
   }));
   return {
