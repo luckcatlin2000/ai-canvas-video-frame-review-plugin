@@ -74,3 +74,55 @@ test('紧凑间距和小尺寸控件不压缩画面或移除隐藏规则', () =>
   assert.match(source, /\.frame img\{width:100%;height:88px;object-fit:contain/);
   assert.match(source, /\.app \[hidden\]\{display:none\}/);
 });
+
+test('胶片按实际时间映射镜头勾选，边界属于下一镜头，区间外不误选', () => {
+  const shots = [shot('s1', 0, 1.5), shot('s2', 1.5, 3, false), shot('s3', 4, 5)];
+  assert.deepEqual(json(api.filmstripState(shots, 0.833, null)), { shotId: 's1', selected: true, current: false });
+  assert.equal(api.filmstripState(shots, 1.499999).shotId, 's1');
+  assert.deepEqual(json(api.filmstripState(shots, 1.5, 1.5)), { shotId: 's2', selected: false, current: true });
+  assert.deepEqual(json(api.filmstripState(shots, 3.5, 0)), { shotId: '', selected: false, current: false });
+  assert.equal(api.filmstripState(shots, 5).shotId, '');
+  assert.equal(api.filmstripState(shots, 0, null).current, false);
+});
+
+test('勾选和拆分后胶片状态同步，定位不修改选中集合', () => {
+  const original = [shot('s1', 0, 4)];
+  const split = api.splitShot(original, 's1', 2, 's2');
+  assert.equal(api.filmstripState(split, 2.5, 2.5).selected, false);
+  const selected = split.map((s) => ({ ...s, selected: true }));
+  assert.equal(api.filmstripState(selected, 2.5, 2.5).selected, true);
+  assert.equal(api.filmstripState(split, 2.5).selected, false);
+  assert.deepEqual(json(original), [shot('s1', 0, 4)]);
+  assert.match(source, /function renderShots\(\)[\s\S]*?syncFilmstrip\(\);/);
+  assert.match(source, /async function inspect\([\s\S]*?syncFilmstrip\(\);/);
+});
+
+test('胶片勾选和当前查看使用独立标记，输出按钮靠右且允许换行', () => {
+  assert.match(source, /frame--selected/);
+  assert.match(source, /frame--unselected/);
+  assert.match(source, /data-frame-current/);
+  assert.match(source, /aria-current/);
+  assert.match(source, /\.footer-actions\{justify-content:flex-end\}/);
+  assert.match(source, /class="row footer-actions"/);
+  assert.match(source, /\.row\{display:flex;flex-wrap:wrap/);
+});
+
+test('结果区有阶段提示和每帧加载动画，尊重减少动态效果设置', () => {
+  assert.match(source, /data-result-section aria-busy="false"/);
+  assert.match(source, /data-loading hidden role="status" aria-live="polite"/);
+  assert.match(source, /data-loading-label/);
+  assert.match(source, /data-card-loading/);
+  assert.match(source, /\.status--busy::before\{[^}]*animation:frame-review-spin/);
+  assert.match(source, /animation:frame-review-spin \.8s linear infinite/);
+  assert.match(source, /@media\(prefers-reduced-motion:reduce\)\{\.spinner\{animation:none\}\}/);
+  assert.match(source, /正在保存画面并生成图片节点/);
+  assert.match(source, /正在保存画面并生成分镜表节点/);
+});
+
+test('忙碌期间新渲染的表单也禁用，异常与成功都在 finally 清除加载状态', () => {
+  const render = source.slice(source.indexOf('    function renderResults()'), source.indexOf('    async function prepareFrames()'));
+  assert.match(render, /controls\(\);\s*\}/);
+  assert.match(source, /el\('loading'\)\.hidden = !state\.busy/);
+  assert.match(source, /overlay\.hidden = !state\.busy/);
+  assert.match(source, /finally \{ if \(!disposed\) \{ state\.busy = false; state\.loadingMessage = ''; controls\(\); \} \}/);
+});

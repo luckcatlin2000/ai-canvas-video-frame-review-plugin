@@ -26,7 +26,7 @@
   ],
   "ui": {
     "entry": "ui.js",
-    "integrity": "sha256-a10f6ee7f86f8dcb8c268a9b8101cfcb3773cf649c4edd98f2d113c370469bd7",
+    "integrity": "sha256-089d8db2d8b94d5e738dd3fc81e953c256d1f323dfff98b4dce2e36669d227f0",
     "exports": {
       "frameReview": "VideoFrameReview"
     }
@@ -63,7 +63,8 @@
               "defaultValue": "请按镜头语言分析每一帧：景别、运镜、画面内容、可见台词线索、声音线索、转场建议与备注。仅依据画面判断；无法确认的台词和声音必须写“无法从画面判断”。"
             }
           ],
-          "ui": "frameReview"
+          "ui": "frameReview",
+          "presentation": "window"
         },
         "nodeTypes": [
           "ai-video",

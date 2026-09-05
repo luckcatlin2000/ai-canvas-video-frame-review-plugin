@@ -21,6 +21,14 @@
     if (shot.role === 'end') return shot.outPoint - Math.min(0.000001, (shot.outPoint - shot.inPoint) / 2);
     return shot.inPoint;
   }
+  function filmstripState(shots, time, cursorTime) {
+    const shot = shots.find((value) => time >= value.inPoint && time < value.outPoint);
+    return {
+      shotId: shot ? shot.id : '',
+      selected: Boolean(shot && shot.selected),
+      current: Number.isFinite(cursorTime) && Math.abs(time - cursorTime) < 0.000001,
+    };
+  }
   function validateShots(shots, duration) {
     if (!shots.length || shots.length > MAX_SHOTS) throw new Error('镜头数量必须为 1–128');
     const ids = new Set();
@@ -113,7 +121,7 @@
     return '\uFEFF' + [columns.map(csvCell).join(','), ...report.frames.map((frame) =>
       columns.map((key) => csvCell(key === 'sourceVideoNodeId' ? report.source.nodeId : key === 'sourceVideoName' ? report.source.name : frame[key])).join(','))].join('\r\n');
   }
-  const logic = { parseTimecode, sampleTime, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv };
+  const logic = { parseTimecode, sampleTime, filmstripState, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv };
   window.__AI_CANVAS_PLUGIN_HOST__.exports.FrameReviewLogic = logic;
 
   window.__AI_CANVAS_PLUGIN_HOST__.exports.VideoFrameReview = function mount(root, props) {
@@ -121,7 +129,7 @@
     const prefix = 'shot-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7) + '-';
     const newId = () => prefix + (++serial);
     const state = { video: null, previews: [], shots: [], activeId: '', cursor: null, results: [], batch: null, sampling: 'interval',
-      busy: false, mode: 'interval', history: [], redo: [] };
+      busy: false, loadingMessage: '', mode: 'interval', history: [], redo: [] };
     const videoResource = (props.resources && props.resources.self || []).find((r) => String(r.mediaType || '').startsWith('video/'));
     const sourceName = String(props.node && props.node.data && props.node.data.label || videoResource && videoResource.displayName || '来源视频').slice(0, 240);
     root.innerHTML = [
@@ -135,10 +143,13 @@
       'button{min-height:28px;border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;line-height:18px;background:var(--card)} button:hover:not(:disabled){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--card))} button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
       '.active,.primary{border-color:var(--accent);color:var(--accent2);background:color-mix(in srgb,var(--accent) 18%,var(--card))} .tabs{display:flex;gap:4px;margin-bottom:6px} .tabs button{flex:1;min-width:0}',
       '.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px} label{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:12px;min-width:0} input,select,textarea{width:100%;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;line-height:18px} input,select{height:28px} input:focus,select:focus,textarea:focus{outline:1px solid var(--accent)} textarea{resize:vertical;line-height:1.5} input[type=checkbox]{width:14px;height:14px;margin:0;flex-shrink:0} .wide{grid-column:1/-1}',
-      '.filmstrip{display:flex;gap:8px;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:2px 0 6px;scrollbar-gutter:stable} .frame{flex:0 0 156px;overflow:hidden;padding:0;display:flex;flex-direction:column;gap:3px} .frame img{width:100%;height:88px;object-fit:contain;background:var(--bg);pointer-events:none} .frame span{padding:0 4px 3px;font-size:11px}',
+      '.filmstrip{display:flex;gap:8px;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:2px 0 6px;scrollbar-gutter:stable} .frame{position:relative;flex:0 0 156px;overflow:hidden;padding:0;display:flex;flex-direction:column;gap:3px} .frame img{width:100%;height:88px;object-fit:contain;background:var(--bg);pointer-events:none} .frame span{padding:0 4px 3px;font-size:11px}',
+      '.frame--selected{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);background:color-mix(in srgb,var(--accent) 16%,var(--card))} .frame--unselected img{opacity:.55} .frame .frame-selection{position:absolute;right:5px;top:5px;padding:2px 5px;font-size:10px;line-height:14px;border:1px solid var(--line);border-radius:5px;background:var(--panel);color:var(--muted)} .frame--selected .frame-selection{border-color:var(--accent);color:var(--accent2)} .frame--current{outline:2px solid var(--success);outline-offset:-3px} .frame .frame-current{position:absolute;left:5px;bottom:24px;padding:1px 5px;font-size:10px;line-height:14px;border-radius:4px;background:var(--panel);color:var(--success)}',
       '.shot-list{max-height:330px;overflow:auto;min-width:0} .shot{display:flex;gap:6px;align-items:center;margin:3px 0;padding:4px;border:1px solid var(--line);border-radius:6px} .shot button{flex:1;min-width:0;text-align:left;overflow-wrap:anywhere} .shot select{width:80px} .shot small{display:block;color:var(--muted);margin-top:2px}',
       '.inspector{width:100%;height:190px;object-fit:contain;background:var(--bg);border-radius:8px} .cursor-input{max-width:180px} .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:8px} .result{border:1px solid var(--line);border-radius:8px;overflow:hidden;min-width:0;background:var(--panel)} .result img{width:100%;height:170px;object-fit:contain;background:var(--bg)} .result-body{padding:8px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px} .empty{border:1px dashed var(--line);padding:16px;color:var(--muted);text-align:center}',
-      'footer{flex-shrink:0;padding:6px 8px;border-top:1px solid var(--line);background:var(--panel);max-height:38%;overflow:auto} .status{margin-top:4px;overflow-wrap:anywhere} @media(max-width:760px){.setup,.workbench{grid-template-columns:minmax(0,1fr)} .workspace{padding:6px} .frame{flex-basis:140px}}',
+      '.result-progress{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px;border:1px solid var(--accent);border-radius:8px;background:var(--panel);color:var(--accent2)} .spinner{display:inline-block;width:16px;height:16px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} .result-preview{position:relative} .result-preview img{display:block} .result-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--panel) 55%,transparent)} .result-loading .spinner{width:24px;height:24px} @keyframes frame-review-spin{to{transform:rotate(360deg)}} @media(prefers-reduced-motion:reduce){.spinner{animation:none}}',
+      '.status--busy{display:flex;align-items:center;gap:6px} .status--busy::before{content:"";width:12px;height:12px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @media(prefers-reduced-motion:reduce){.status--busy::before{animation:none}}',
+      'footer{flex-shrink:0;padding:6px 8px;border-top:1px solid var(--line);background:var(--panel);max-height:38%;overflow:auto} .footer-actions{justify-content:flex-end} .status{margin-top:4px;overflow-wrap:anywhere} @media(max-width:760px){.setup,.workbench{grid-template-columns:minmax(0,1fr)} .workspace{padding:6px} .frame{flex-basis:140px}}',
       '</style><main class="app"><div class="workspace"><div class="setup">',
       '<section class="panel"><h3>1. 选择采样方式</h3><div class="tabs"><button data-mode="interval" class="active">固定间隔</button><button data-mode="manual">指定帧</button><button data-mode="auto">自动镜头</button></div>',
       '<div data-group="range" class="fields"><label>入点（秒）<input data-start type="number" min="0" step="0.001" value="0"></label><label>出点（秒）<input data-end type="number" step="0.001"></label><label data-group="step">间隔（秒）<input data-step type="number" min="0.001" step="0.1" value="1"></label></div>',
@@ -147,27 +158,35 @@
       '<div class="row spaced"><button data-apply>应用采样</button><span class="hint" data-selection></span></div></section>',
       '<section class="panel"><h3>2. 分析设置</h3><label>视觉模型<select data-model></select></label><label class="spaced">分析要求<textarea data-prompt rows="3"></textarea></label>',
       '<div class="row spaced"><button data-extract>仅抽帧 / 人工填写</button><button data-analyze class="primary">开始 AI 拉片</button></div><p class="hint">每镜头选择一张代表帧。AI 基于静态联系表分析；运镜和声音仅作线索，不等同于完整视频分析。</p></section></div>',
-      '<section class="panel"><div class="row"><h3>视频胶片</h3><button data-left aria-label="向左浏览缩略图">←</button><button data-right aria-label="向右浏览缩略图">→</button><span class="hint">可滚轮、触控板或方向键横向浏览；点击画面定位。</span></div><div data-filmstrip class="filmstrip" tabindex="0" aria-label="视频胶片横向浏览"></div></section>',
+      '<section class="panel"><div class="row"><h3>视频胶片</h3><button data-left aria-label="向左浏览缩略图">←</button><button data-right aria-label="向右浏览缩略图">→</button><span class="hint">标记同步下方镜头勾选；点击画面仅定位，不改变勾选。可滚轮、触控板或方向键横向浏览。</span></div><div data-filmstrip class="filmstrip" tabindex="0" aria-label="视频胶片横向浏览"></div></section>',
       '<div class="workbench"><section class="panel"><h3>3. 镜头校正</h3><div class="row"><button data-merge>合并勾选镜头</button><button data-none>取消勾选</button><button data-undo>撤销</button><button data-redo>重做</button></div><div data-shots class="shot-list spaced"></div><p class="hint">勾选用于本批输出（最多 24 镜）。拆分保留左镜 ID，合并保留首镜 ID。更改镜头后需重新抽帧。</p></section>',
       '<section class="panel"><h3>逐帧检查</h3><img data-inspector class="inspector" alt="当前帧预览" hidden><div class="row spaced"><button data-prev>← 前一帧</button><input data-cursor class="cursor-input" aria-label="定位时间码" value="0"><button data-locate>定位</button><button data-next>后一帧 →</button></div>',
       '<div class="row spaced"><button data-custom>当前帧作代表</button><button data-split>在当前帧拆分</button></div><div class="row spaced"><span class="hint">当前镜头边界</span><button data-boundary="inPoint:-1">入点 −1 帧</button><button data-boundary="inPoint:1">入点 +1 帧</button><button data-boundary="outPoint:-1">出点 −1 帧</button><button data-boundary="outPoint:1">出点 +1 帧</button></div><p data-inspect-status class="hint">点击镜头后检查首、中、尾帧；前后帧使用实际解码时间戳。</p></section></div>',
-      '<section><h3>4. 拉片结果与人工复核</h3><div class="results" data-results></div></section></div>',
-      '<footer><div class="row"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div></footer></main>',
+      '<section data-result-section aria-busy="false"><h3>4. 拉片结果与人工复核</h3><div class="result-progress" data-loading hidden role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span data-loading-label></span></div><div class="results" data-results></div></section></div>',
+      '<footer><div class="row footer-actions"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div></footer></main>',
     ].join('');
     const el = (name) => root.querySelector('[data-' + name + ']');
-    const listen = (name, fn) => el(name).addEventListener('click', () => void action(fn));
-    const status = (message, error) => { el('status').textContent = message; el('status').classList.toggle('error', Boolean(error)); };
+    const listen = (name, fn, loadingMessage) => el(name).addEventListener('click', () => void action(fn, loadingMessage));
+    const status = (message, error) => {
+      el('status').textContent = message; el('status').classList.toggle('error', Boolean(error));
+      if (state.busy && !error) { state.loadingMessage = message; el('loading-label').textContent = message; }
+    };
     function controls() {
       root.querySelectorAll('button,input,select,textarea').forEach((control) => { control.disabled = state.busy; });
       el('undo').disabled = state.busy || !state.history.length;
       el('redo').disabled = state.busy || !state.redo.length;
       ['images', 'shotlist', 'contact', 'json', 'csv'].forEach((name) => { el(name).disabled = state.busy || !state.results.length; });
+      el('result-section').setAttribute('aria-busy', String(state.busy));
+      el('loading').hidden = !state.busy;
+      el('loading-label').textContent = state.loadingMessage;
+      el('status').classList.toggle('status--busy', state.busy);
+      root.querySelectorAll('[data-card-loading]').forEach((overlay) => { overlay.hidden = !state.busy; });
     }
-    async function action(fn) {
+    async function action(fn, loadingMessage = '正在处理…') {
       if (state.busy || disposed) return;
-      state.busy = true; controls();
+      state.busy = true; state.loadingMessage = loadingMessage; controls();
       try { await fn(); } catch (error) { if (!disposed) status(error instanceof Error ? error.message : String(error), true); }
-      finally { if (!disposed) { state.busy = false; controls(); } }
+      finally { if (!disposed) { state.busy = false; state.loadingMessage = ''; controls(); } }
     }
     async function effect(request) {
       const response = await props.runEffect(request);
@@ -201,6 +220,7 @@
       el('inspector').hidden = false; el('inspector').src = frame.previewDataUrl;
       el('cursor').value = String(frame.actualTime);
       el('inspect-status').textContent = '实际时间 ' + formatTimecode(frame.actualTime) + ' · 帧时长 ' + frame.frameDuration.toFixed(6) + ' 秒';
+      syncFilmstrip();
       return frame;
     }
     function renderShots() {
@@ -229,15 +249,40 @@
         }));
         row.append(check, select, role); el('shots').appendChild(row);
       });
+      syncFilmstrip();
+    }
+    function syncFilmstrip() {
+      // 原位更新标记，保留横向滚动位置与键盘焦点。
+      const nodes = el('filmstrip').children;
+      state.previews.forEach((frame, index) => {
+        const node = nodes[index];
+        if (!node) return;
+        const view = filmstripState(state.shots, frame.actualTime, state.cursor && state.cursor.actualTime);
+        node.classList.toggle('frame--selected', view.selected);
+        node.classList.toggle('frame--unselected', !view.selected);
+        node.classList.toggle('frame--current', view.current);
+        const label = view.shotId ? (view.selected ? '✓ 镜头已选' : '○ 镜头未选') : '— 区间外';
+        node.querySelector('[data-frame-selection]').textContent = label;
+        node.querySelector('[data-frame-current]').hidden = !view.current;
+        node.setAttribute('aria-label', '定位 ' + formatTimecode(frame.actualTime) + ' · ' + label + (view.current ? ' · 查看中' : ''));
+        if (view.current) node.setAttribute('aria-current', 'true'); else node.removeAttribute('aria-current');
+      });
     }
     function renderFilmstrip() {
       el('filmstrip').replaceChildren();
       state.previews.forEach((frame) => {
-        const node = button('', () => inspect(frame.actualTime));
+        const node = button('', async () => {
+          const view = filmstripState(state.shots, frame.actualTime);
+          if (view.shotId) { state.activeId = view.shotId; renderShots(); }
+          await inspect(frame.actualTime);
+        });
         node.className = 'frame'; node.title = '定位 ' + formatTimecode(frame.actualTime);
         const image = element('img'); image.alt = '视频预览 ' + formatTimecode(frame.actualTime); image.src = frame.previewDataUrl;
-        node.append(image, element('span', '', formatTimecode(frame.actualTime))); el('filmstrip').appendChild(node);
+        const selection = element('span', 'frame-selection'); selection.dataset.frameSelection = ''; selection.setAttribute('aria-hidden', 'true');
+        const current = element('span', 'frame-current', '查看中'); current.dataset.frameCurrent = ''; current.setAttribute('aria-hidden', 'true'); current.hidden = true;
+        node.append(image, element('span', '', formatTimecode(frame.actualTime)), selection, current); el('filmstrip').appendChild(node);
       });
+      syncFilmstrip();
     }
     async function applySampling() {
       if (!state.video) throw new Error('视频尚未就绪');
@@ -265,7 +310,7 @@
     }
     function renderResults() {
       el('results').replaceChildren();
-      if (!state.results.length) { el('results').appendChild(element('div', 'empty', '选择镜头，抽帧后可 AI 分析或人工填写')); return; }
+      if (!state.results.length) { el('results').appendChild(element('div', 'empty', '选择镜头，抽帧后可 AI 分析或人工填写')); controls(); return; }
       state.results.forEach((result) => {
         const card = element('article', 'result'), body = element('div', 'result-body'), image = element('img');
         image.src = result.previewDataUrl; image.alt = result.shotId;
@@ -294,8 +339,12 @@
           if (!Object.keys(result.aiOriginal).length) throw new Error('还没有 AI 原文');
           result.overrideFields = []; Object.assign(result, mergeAnalysis(result, result.aiOriginal)); renderResults();
         }));
-        body.appendChild(actions); card.append(image, body); el('results').appendChild(card);
+        const preview = element('div', 'result-preview'), overlay = element('div', 'result-loading');
+        overlay.setAttribute('data-card-loading', ''); overlay.setAttribute('aria-hidden', 'true');
+        overlay.appendChild(element('span', 'spinner')); preview.append(image, overlay);
+        body.appendChild(actions); card.append(preview, body); el('results').appendChild(card);
       });
+      controls();
     }
     async function prepareFrames() {
       const shots = state.shots.filter((s) => s.selected);
@@ -358,6 +407,7 @@
     async function submit(outputMode) {
       assertComplete();
       if (state.results.some((r) => r.analysisError || r.reviewStatus === 'edited')) throw new Error('请先确认缺失结果和人工修改的复核状态');
+      status(outputMode === 'images' ? '正在保存画面并生成图片节点…' : '正在保存画面并生成分镜表节点…');
       await props.submit({ outputMode, videoDuration: state.video.duration,
         frames: state.results.map((r) => ({ ...publicFrame(r), resourceId: r.resourceId, width: r.width, height: r.height })) });
     }
@@ -376,7 +426,7 @@
     }));
     listen('apply', applySampling);
     listen('extract', async () => { await prepareFrames(); status('抽帧完成，可人工填写并确认，或继续 AI 拉片。'); });
-    listen('analyze', analyze);
+    listen('analyze', analyze, '正在准备 AI 拉片…');
     listen('merge', () => commitShots(mergeShots(state.shots)));
     listen('none', () => commitShots(state.shots.map((s) => ({ ...s, selected: false }))));
     listen('undo', () => {
@@ -408,7 +458,7 @@
       const next = moveBoundary(state.shots, state.shots.indexOf(shot), edge, frame.boundaryTime ?? frame.actualTime);
       commitShots(next); status('边界已按实际帧移动；相邻镜头同步调整。');
     })));
-    listen('images', () => submit('images')); listen('shotlist', () => submit('shotlist'));
+    listen('images', () => submit('images'), '正在生成图片节点…'); listen('shotlist', () => submit('shotlist'), '正在生成分镜表节点…');
     listen('json', () => exportReport('json')); listen('csv', () => exportReport('csv'));
     listen('contact', async () => {
       assertComplete();
