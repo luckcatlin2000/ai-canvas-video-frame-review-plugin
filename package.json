@@ -1,0 +1,16 @@
+{
+  "name": "ai-canvas-video-frame-review-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AI-Canvas 逐帧拉片视频节点工具插件",
+  "scripts": {
+    "test": "node --test",
+    "verify": "node scripts/verify-release.mjs",
+    "build": "node scripts/build.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
