@@ -47,12 +47,13 @@ test('关闭界面后不再请求分段或生成迟到播放器数据', async ()
   assert.equal(reads, 1); assert.equal(progress, 0);
 });
 
-test('原视频位于采样和分析之间，支持窄窗口、手动播放与清理', () => {
-  assert.ok(source.indexOf('<h3>1. 选择采样方式') < source.indexOf('<h3>原视频'));
-  assert.ok(source.indexOf('<h3>原视频') < source.indexOf('<h3>2. 分析设置'));
+test('准备、校正、分析、复核按顺序展示，保留手动播放和清理', () => {
+  const stages = ['sampling', 'correction', 'analysis', 'results'].map((stage) => source.indexOf('data-stage="' + stage + '"'));
+  assert.ok(stages.every((offset, index) => offset >= 0 && (!index || offset > stages[index - 1])));
+  assert.ok(source.indexOf('<h3>原视频') < stages[1]);
   assert.match(source, /controls playsinline preload="metadata"/);
   assert.doesNotMatch(source, /autoplay/);
-  assert.match(source, /@media\(max-width:980px\)\{\.setup\{grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(source, /@media\(max-width:760px\)\{\.setup,\.workbench\{grid-template-columns:minmax\(0,1fr\)\}/);
   assert.match(source, /sourceVideo\.pause\(\); sourceVideo\.removeAttribute\('src'\); sourceVideo\.load\(\)/);
   assert.match(source, /URL\.revokeObjectURL\(sourceVideoUrl\)/);
 });
@@ -112,13 +113,11 @@ test('布局显式限制横向宽度并提供滚轮、键盘和按钮浏览', ()
   assert.match(source, /data-left/); assert.match(source, /data-right/);
 });
 
-test('紧凑间距和小尺寸控件不压缩画面或移除隐藏规则', () => {
-  assert.match(source, /\.workspace\{[^}]*padding:8px/);
-  assert.match(source, /\.panel\{[^}]*padding:8px;margin-bottom:8px/);
+test('小尺寸控件保留可读字号，预览完整显示且保留隐藏规则', () => {
   assert.match(source, /button\{min-height:28px;[^}]*padding:4px 8px;font-size:12px;line-height:18px/);
   assert.match(source, /input,select\{height:28px\}/);
   assert.match(source, /input\[type=checkbox\]\{width:14px;height:14px/);
-  assert.match(source, /\.frame img\{width:100%;height:88px;object-fit:contain/);
+  assert.match(source, /\.frame img\{width:100%;height:\d+px;object-fit:contain/);
   assert.match(source, /\.app \[hidden\]\{display:none\}/);
 });
 
@@ -149,13 +148,13 @@ test('胶片勾选和当前查看使用独立标记，输出按钮靠右且允�
   assert.match(source, /frame--unselected/);
   assert.match(source, /data-frame-current/);
   assert.match(source, /aria-current/);
-  assert.match(source, /\.footer-actions\{justify-content:flex-end\}/);
+  assert.match(source, /\.footer-actions\{[^}]*justify-content:flex-end(?:;|\})/);
   assert.match(source, /class="row footer-actions"/);
   assert.match(source, /\.row\{display:flex;flex-wrap:wrap/);
 });
 
 test('结果区有阶段提示和每帧加载动画，尊重减少动态效果设置', () => {
-  assert.match(source, /data-result-section aria-busy="false"/);
+  assert.match(source, /data-result-section[^>]*aria-busy="false"/);
   assert.match(source, /data-loading hidden role="status" aria-live="polite"/);
   assert.match(source, /data-loading-label/);
   assert.match(source, /data-card-loading/);
@@ -172,4 +171,14 @@ test('忙碌期间新渲染的表单也禁用，异常与成功都在 finally �
   assert.match(source, /el\('loading'\)\.hidden = !state\.busy/);
   assert.match(source, /overlay\.hidden = !state\.busy/);
   assert.match(source, /finally \{ if \(!disposed\) \{ state\.busy = false; state\.loadingMessage = ''; controls\(\); \} \}/);
+});
+
+test('立体胶片聚焦最接近的真实预览帧，不将非采样时刻冒充当前帧', () => {
+  const previews = [{ actualTime: 0 }, { actualTime: 1 }, { actualTime: 2.4 }];
+  assert.equal(api.filmstripFocusIndex([], 0), -1);
+  assert.equal(api.filmstripFocusIndex(previews, NaN), 0);
+  assert.equal(api.filmstripFocusIndex(previews, 0.5), 0);
+  assert.equal(api.filmstripFocusIndex(previews, 0.8), 1);
+  assert.equal(api.filmstripFocusIndex(previews, 3), 2);
+  assert.equal(api.filmstripState([shot('s1', 0, 3)], 1, 0.8).current, false);
 });

@@ -29,6 +29,12 @@
       current: Number.isFinite(cursorTime) && Math.abs(time - cursorTime) < 0.000001,
     };
   }
+  function filmstripFocusIndex(previews, time) {
+    if (!previews.length) return -1;
+    if (!Number.isFinite(time)) return 0;
+    return previews.reduce((closest, frame, index) =>
+      Math.abs(frame.actualTime - time) < Math.abs(previews[closest].actualTime - time) ? index : closest, 0);
+  }
   function validateShots(shots, duration) {
     if (!shots.length || shots.length > MAX_SHOTS) throw new Error('镜头数量必须为 1–128');
     const ids = new Set();
@@ -145,7 +151,7 @@
     }
     return new Blob(parts, { type: resource.mediaType });
   }
-  const logic = { parseTimecode, sampleTime, filmstripState, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv, readSourceVideo };
+  const logic = { parseTimecode, sampleTime, filmstripState, filmstripFocusIndex, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv, readSourceVideo };
   window.__AI_CANVAS_PLUGIN_HOST__.exports.FrameReviewLogic = logic;
 
   window.__AI_CANVAS_PLUGIN_HOST__.exports.VideoFrameReview = function mount(root, props) {
@@ -153,43 +159,53 @@
     const prefix = 'shot-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7) + '-';
     const newId = () => prefix + (++serial);
     const state = { video: null, previews: [], shots: [], activeId: '', cursor: null, results: [], batch: null, sampling: 'interval',
-      busy: false, loadingMessage: '', mode: 'interval', history: [], redo: [] };
+      busy: false, loadingMessage: '', mode: 'interval', deckFlat: false, history: [], redo: [] };
     const videoResource = (props.resources && props.resources.self || []).find((r) => String(r.mediaType || '').startsWith('video/'));
     const sourceName = String(props.node && props.node.data && props.node.data.label || videoResource && videoResource.displayName || '来源视频').slice(0, 240);
     root.innerHTML = [
       '<style>',
-      "        :root { color-scheme: dark; --bg:#101018; --panel:#181824; --card:#1e1e2b; --line:#303044; --text:#ececf2; --muted:#9a9aac; --soft:#727287; --accent:#7c6df2; --accent2:#a79dff; --danger:#ff7f8e; --success:#63d3a6; --shadow:0 16px 40px rgba(0,0,0,.2); }\n        :root[data-theme=\"light\"] { color-scheme: light; --bg:#f7f5fb; --panel:#fffafd; --card:#f2eff8; --line:#ddd7e7; --text:#34303d; --muted:#746e7f; --soft:#948da0; --accent:#7165d8; --accent2:#675bbf; --danger:#c84d60; --success:#258c69; --shadow:0 16px 36px rgba(92,74,116,.12); }",
-      '*{box-sizing:border-box} html,body,#root{width:100%;height:100%;min-width:0;margin:0} body{overflow:auto;background:var(--bg);color:var(--text);font:13px "Segoe UI","Microsoft YaHei",sans-serif}',
-      'button,input,select,textarea{font:inherit;color:inherit} button{cursor:pointer} button:disabled{opacity:.45;cursor:not-allowed} .app [hidden]{display:none}',
-      '.app{height:100%;min-height:0;min-width:0;display:flex;flex-direction:column} .workspace{flex:1;min-height:0;min-width:0;overflow:auto;overscroll-behavior:contain;padding:8px;scrollbar-gutter:stable}',
-      '.setup,.workbench{display:grid;gap:8px} .setup{grid-template-columns:minmax(0,1fr) minmax(0,.7fr) minmax(0,1fr)} .workbench{grid-template-columns:repeat(2,minmax(0,1fr))} .panel{min-width:0;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:8px;margin-bottom:8px}',
-      '.source-video{display:block;width:100%;height:210px;object-fit:contain;background:var(--bg);border-radius:6px} .source-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} @media(max-width:980px){.setup{grid-template-columns:minmax(0,1fr)}}',
-      'h3{margin:0 0 6px;font-size:14px} .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .spaced{margin-top:6px} .hint{color:var(--muted);font-size:12px;line-height:1.5;overflow-wrap:anywhere} .panel p.hint{margin:6px 0 0} .error{color:var(--danger)}',
-      'button{min-height:28px;border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;line-height:18px;background:var(--card)} button:hover:not(:disabled){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--card))} button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
-      '.active,.primary{border-color:var(--accent);color:var(--accent2);background:color-mix(in srgb,var(--accent) 18%,var(--card))} .tabs{display:flex;gap:4px;margin-bottom:6px} .tabs button{flex:1;min-width:0}',
-      '.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px} label{display:flex;flex-direction:column;gap:3px;color:var(--muted);font-size:12px;min-width:0} input,select,textarea{width:100%;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;line-height:18px} input,select{height:28px} input:focus,select:focus,textarea:focus{outline:1px solid var(--accent)} textarea{resize:vertical;line-height:1.5} input[type=checkbox]{width:14px;height:14px;margin:0;flex-shrink:0} .wide{grid-column:1/-1}',
-      '.filmstrip{display:flex;gap:8px;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:2px 0 6px;scrollbar-gutter:stable} .frame{position:relative;flex:0 0 156px;overflow:hidden;padding:0;display:flex;flex-direction:column;gap:3px} .frame img{width:100%;height:88px;object-fit:contain;background:var(--bg);pointer-events:none} .frame span{padding:0 4px 3px;font-size:11px}',
-      '.frame--selected{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);background:color-mix(in srgb,var(--accent) 16%,var(--card))} .frame--unselected img{opacity:.55} .frame .frame-selection{position:absolute;right:5px;top:5px;padding:2px 5px;font-size:10px;line-height:14px;border:1px solid var(--line);border-radius:5px;background:var(--panel);color:var(--muted)} .frame--selected .frame-selection{border-color:var(--accent);color:var(--accent2)} .frame--current{outline:2px solid var(--success);outline-offset:-3px} .frame .frame-current{position:absolute;left:5px;bottom:24px;padding:1px 5px;font-size:10px;line-height:14px;border-radius:4px;background:var(--panel);color:var(--success)}',
-      '.shot-list{max-height:330px;overflow:auto;min-width:0} .shot{display:flex;gap:6px;align-items:center;margin:3px 0;padding:4px;border:1px solid var(--line);border-radius:6px} .shot button{flex:1;min-width:0;text-align:left;overflow-wrap:anywhere} .shot select{width:80px} .shot small{display:block;color:var(--muted);margin-top:2px}',
-      '.inspector{width:100%;height:190px;object-fit:contain;background:var(--bg);border-radius:8px} .cursor-input{max-width:180px} .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:8px} .result{border:1px solid var(--line);border-radius:8px;overflow:hidden;min-width:0;background:var(--panel)} .result img{width:100%;height:170px;object-fit:contain;background:var(--bg)} .result-body{padding:8px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px} .empty{border:1px dashed var(--line);padding:16px;color:var(--muted);text-align:center}',
-      '.result-progress{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px;border:1px solid var(--accent);border-radius:8px;background:var(--panel);color:var(--accent2)} .spinner{display:inline-block;width:16px;height:16px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} .result-preview{position:relative} .result-preview img{display:block} .result-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--panel) 55%,transparent)} .result-loading .spinner{width:24px;height:24px} @keyframes frame-review-spin{to{transform:rotate(360deg)}} @media(prefers-reduced-motion:reduce){.spinner{animation:none}}',
-      '.status--busy{display:flex;align-items:center;gap:6px} .status--busy::before{content:"";width:12px;height:12px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @media(prefers-reduced-motion:reduce){.status--busy::before{animation:none}}',
-      'footer{flex-shrink:0;padding:6px 8px;border-top:1px solid var(--line);background:var(--panel);max-height:38%;overflow:auto} .footer-actions{justify-content:flex-end} .status{margin-top:4px;overflow-wrap:anywhere} @media(max-width:760px){.setup,.workbench{grid-template-columns:minmax(0,1fr)} .workspace{padding:6px} .frame{flex-basis:140px}}',
-      '</style><main class="app"><div class="workspace"><div class="setup">',
-      '<section class="panel"><h3>1. 选择采样方式</h3><div class="tabs"><button data-mode="interval" class="active">固定间隔</button><button data-mode="manual">指定帧</button><button data-mode="auto">自动镜头</button></div>',
+      ':root{color-scheme:dark;--bg:#101014;--panel:#19191f;--card:#25252e;--line:#363640;--text:#ececf2;--muted:#a4a4b3;--soft:#8c8c9d;--accent:#7c6df2;--accent2:#b5aaff;--danger:#ff7f8e;--success:#63d3a6;--glass-edge:#888895;--shadow:0 12px 28px rgba(0,0,0,.24)}',
+      ':root[data-theme="light"]{color-scheme:light;--bg:#f5f4f8;--panel:#fcfbfe;--card:#eae8f0;--line:#d8d5e1;--text:#34303d;--muted:#746e7f;--soft:#827c8e;--accent:#7165d8;--accent2:#675bbf;--danger:#c84d60;--success:#258c69;--glass-edge:#aaa5b6;--shadow:0 12px 28px rgba(71,62,95,.09)}',
+      '*{box-sizing:border-box;scrollbar-width:none} *::-webkit-scrollbar{display:none;width:0;height:0} html,body,#root{width:100%;height:100%;min-width:0;margin:0} body{overflow:auto;background:var(--bg);color:var(--text);font:13px "Segoe UI","Microsoft YaHei",sans-serif}',
+      'button,input,select,textarea{font:inherit;color:inherit} button{cursor:pointer} button:disabled{opacity:.42;cursor:not-allowed} .app [hidden]{display:none}',
+      '.app{height:100%;min-height:0;min-width:0;display:flex;flex-direction:column;background:var(--bg)} .workspace{flex:1;min-height:0;min-width:0;overflow:auto;overscroll-behavior:contain;padding:12px 14px}',
+      '.setup,.workbench{display:grid;gap:20px} .setup{grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);align-items:start;padding-bottom:10px;border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent)} .workbench{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;margin:10px 0 14px} .panel{min-width:0;padding:8px}',
+      '.section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px} .section-title{display:flex;align-items:center;gap:8px;min-width:0} .step{display:inline-grid;place-items:center;width:24px;height:24px;flex-shrink:0;border:1px solid var(--line);border-radius:50%;background:var(--panel);color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.02em} h3{margin:0;font-size:14px;font-weight:600} .eyebrow{font-size:11px;color:var(--soft);letter-spacing:.04em} .pill{border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;color:var(--muted);white-space:nowrap}',
+      '.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .spaced{margin-top:6px} .hint{color:var(--muted);font-size:12px;line-height:1.5;overflow-wrap:anywhere} .panel p.hint{margin:6px 0 0} .error{color:var(--danger)} .subtle{font-size:11px;color:var(--soft)}',
+      'button{min-height:28px;border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12px;line-height:18px;background:var(--panel);transition:background .16s,border-color .16s} button:hover:not(:disabled){border-color:var(--glass-edge);background:var(--card)} button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}',
+      '.active,.primary{border-color:color-mix(in srgb,var(--accent) 65%,var(--line));color:var(--accent2);background:color-mix(in srgb,var(--accent) 12%,var(--panel))} .primary{font-weight:600;box-shadow:inset 0 1px 0 color-mix(in srgb,var(--text) 8%,transparent)} .tabs{display:flex;gap:4px;margin-bottom:8px;padding:3px;border:1px solid var(--line);border-radius:999px;background:var(--panel);max-width:460px} .tabs button{flex:1;min-width:0;border-color:transparent;border-radius:999px;background:transparent} .tabs .active{border-color:color-mix(in srgb,var(--accent) 36%,var(--line));background:color-mix(in srgb,var(--accent) 12%,var(--panel))}',
+      '.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px} label{display:flex;flex-direction:column;gap:4px;color:var(--muted);font-size:12px;min-width:0} input,select,textarea{width:100%;min-width:0;border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:4px 7px;font-size:12px} input,select{height:28px} textarea{resize:vertical;min-height:48px;line-height:1.5} input[type=checkbox]{width:14px;height:14px;flex-shrink:0;accent-color:var(--accent)} select option{background:var(--panel);color:var(--text)} input:focus-visible,select:focus-visible,textarea:focus-visible{outline:1px solid var(--accent);outline-offset:1px}',
+      '.source-panel{border:1px solid color-mix(in srgb,var(--line) 75%,transparent);border-radius:12px;background:var(--panel)} .source-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(110px,.7fr);gap:10px;align-items:center} .source-video{display:block;width:100%;height:116px;object-fit:contain;background:var(--bg);border-radius:7px} .source-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)} .source-meta{min-width:0} .source-meta .hint{margin-top:5px} .source-meta .eyebrow{display:block;margin-bottom:9px}',
+      '.film-panel{padding:12px 0 4px} .film-panel .section-head{margin:0 8px} .film-tools{display:flex;gap:3px;align-items:center;padding:3px;border:1px solid var(--line);border-radius:999px;background:var(--panel)} .film-tools button{border-color:transparent;background:transparent;border-radius:999px;min-width:30px} .film-tools [aria-pressed="true"]{color:var(--accent2);background:color-mix(in srgb,var(--accent) 10%,var(--panel))} .film-help{margin:0 8px;font-size:11px;color:var(--soft)}',
+      '.filmstrip{display:flex;gap:0;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:16px 16px 18px;isolation:isolate;justify-content:safe center;scroll-padding-inline:20px;background:radial-gradient(ellipse at 50% 95%,color-mix(in srgb,var(--text) 5%,transparent),transparent 66%)} .frame{position:relative;flex:0 0 142px;min-height:154px;margin-right:-48px;overflow:hidden;padding:5px;display:flex;flex-direction:column;gap:4px;border:1px solid var(--glass-edge);border-radius:10px;background:linear-gradient(125deg,color-mix(in srgb,var(--text) 15%,var(--panel)),color-mix(in srgb,var(--panel) 88%,transparent) 40%,color-mix(in srgb,var(--text) 9%,var(--panel)));backdrop-filter:blur(12px);box-shadow:3px 4px 0 -2px color-mix(in srgb,var(--glass-edge) 60%,transparent),8px 12px 18px color-mix(in srgb,var(--bg) 80%,transparent),inset 0 1px 0 color-mix(in srgb,var(--text) 25%,transparent);transform:perspective(740px) rotateY(-40deg) rotateZ(2deg) scale(.94);transform-origin:center;transition:transform .24s,box-shadow .24s,border-color .2s;z-index:1} .frame::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:linear-gradient(115deg,color-mix(in srgb,var(--text) 10%,transparent),transparent 35%,transparent 72%,color-mix(in srgb,var(--text) 6%,transparent))} .frame:last-child{margin-right:0} .frame img{width:100%;height:118px;object-fit:contain;background:var(--bg);border-radius:5px;pointer-events:none} .frame-time{padding:1px 2px;font-size:11px;font-variant-numeric:tabular-nums;color:var(--text)}',
+      '.frame--before{transform:perspective(740px) rotateY(40deg) rotateZ(-2deg) scale(.94)} .frame--focus,.frame:focus-visible{transform:perspective(740px) rotateY(0) translateY(-6px) scale(1.035);z-index:4;border-color:var(--accent2);background:linear-gradient(125deg,color-mix(in srgb,var(--text) 18%,var(--panel)),var(--panel));box-shadow:0 14px 28px color-mix(in srgb,var(--bg) 85%,transparent),inset 0 1px 0 color-mix(in srgb,var(--text) 30%,transparent)} .frame:not(.frame--focus):hover:not(:disabled){border-color:var(--text)} .frame:focus-visible{z-index:5} .frame--unselected img{opacity:.7} .frame-index,.frame-selection,.frame-current{position:absolute;z-index:1;background:color-mix(in srgb,var(--bg) 90%,transparent);border:1px solid color-mix(in srgb,var(--text) 18%,transparent);color:var(--text);font-size:10px;line-height:16px;padding:0 4px;border-radius:5px} .frame-index{top:8px;left:8px;font-variant-numeric:tabular-nums} .frame-selection{top:8px;right:8px} .frame--selected .frame-selection{color:var(--accent2)} .frame-current{bottom:32px;left:8px;color:var(--accent2)} .filmstrip--flat{gap:8px} .filmstrip--flat .frame{margin:0;transform:none;flex-basis:144px} .filmstrip--flat .frame--focus{border-color:var(--accent2)}',
+      '.correction-panel{padding:8px 10px 8px 8px} .shot-list{max-height:138px;overflow:auto;min-width:0} .shot{display:flex;gap:6px;align-items:center;margin:0;padding:4px 6px;border:0;border-bottom:1px solid color-mix(in srgb,var(--line) 60%,transparent);border-radius:0;background:transparent} .shot.active{background:color-mix(in srgb,var(--text) 5%,transparent);box-shadow:inset 2px 0 0 var(--accent);border-radius:0 6px 6px 0} .shot button{flex:1;min-width:0;text-align:left;overflow-wrap:anywhere;border-color:transparent;background:transparent;padding:3px 4px} .shot select{width:76px;background:transparent;border-color:transparent} .shot select:hover{border-color:var(--line)} .shot small{display:block;color:var(--muted);margin-top:2px;font-size:10px;font-variant-numeric:tabular-nums}',
+      '.inspection-panel{position:relative;border:1px solid color-mix(in srgb,var(--glass-edge) 56%,var(--line));border-radius:15px;padding:12px;background:linear-gradient(135deg,color-mix(in srgb,var(--text) 6%,var(--panel)),var(--panel) 70%);box-shadow:inset 0 1px 0 color-mix(in srgb,var(--text) 10%,transparent),var(--shadow)} .inspect-layout{display:grid;grid-template-columns:minmax(100px,.72fr) minmax(0,1.28fr);gap:10px} .inspect-image{position:relative;min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--bg);overflow:hidden;min-height:154px} .inspector{width:100%;height:154px;object-fit:contain;background:var(--bg);display:block} .inspect-empty{height:154px;display:grid;place-content:center;text-align:center;gap:7px;color:var(--soft);font-size:11px;padding:10px} .inspect-empty span:first-child{font-size:25px;color:var(--glass-edge)} .cursor-input{max-width:110px;flex:1;min-width:46px} .inspect-controls .row{gap:4px} .inspect-controls button{padding-inline:6px} .boundary-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin-top:5px}',
+      '.analysis-panel{padding:12px 8px 10px;border-top:1px solid var(--line);border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent)} .analysis-grid{display:grid;grid-template-columns:minmax(170px,.65fr) minmax(0,1.35fr) auto;gap:10px;align-items:end} .analysis-actions{display:flex;flex-direction:column;gap:5px;align-items:stretch} .analysis-actions .primary{min-width:164px} .analysis-hint{font-size:11px;color:var(--soft);line-height:1.5;margin:6px 0 0} .analysis-summary{color:var(--muted);font-size:11px}',
+      '.results-heading{margin:12px 8px 8px} .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:8px} .result{border:1px solid var(--line);border-radius:12px;overflow:hidden;min-width:0;background:var(--panel);box-shadow:var(--shadow)} .result img{width:100%;height:155px;object-fit:contain;background:var(--bg)} .result-body{padding:8px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px} .wide{grid-column:1/-1} .empty{padding:14px 8px;color:var(--muted);text-align:center;font-size:12px}',
+      '.result-preview{position:relative;min-height:155px} .result-loading{position:absolute;inset:0;display:grid;place-items:center;background:color-mix(in srgb,var(--bg) 65%,transparent)} .result-progress{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--card);padding:8px;margin-bottom:8px} .spinner{width:22px;height:22px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @keyframes frame-review-spin{to{transform:rotate(360deg)}} @media(prefers-reduced-motion:reduce){.spinner{animation:none}}',
+      '.status--busy{display:flex;align-items:center;gap:6px} .status--busy::before{content:"";width:12px;height:12px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @media(prefers-reduced-motion:reduce){.status--busy::before{animation:none} .frame,button{transition:none}}',
+      'footer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;flex-shrink:0;padding:6px 8px;border-top:1px solid var(--line);background:var(--panel);max-height:38%;overflow:auto} .footer-actions{flex:0 1 auto;justify-content:flex-end;margin-left:auto} .status{flex:1 1 220px;min-width:0;margin:0;overflow-wrap:anywhere}',
+      '@media(max-width:980px){.setup,.workbench{gap:12px} .source-layout{grid-template-columns:minmax(0,1fr)} .source-meta .eyebrow{display:none} .analysis-grid{grid-template-columns:minmax(150px,.65fr) minmax(0,1.35fr)} .analysis-actions{grid-column:1/-1;flex-direction:row;justify-content:flex-end} .inspect-layout{grid-template-columns:minmax(0,1fr)} .inspect-image,.inspector,.inspect-empty{height:132px;min-height:132px}}',
+      '@media(max-width:760px){.setup,.workbench{grid-template-columns:minmax(0,1fr)} .workspace{padding:8px} .source-layout{grid-template-columns:minmax(0,1fr) minmax(110px,.7fr)} .frame{flex-basis:132px;margin-right:-23px} .inspect-layout{grid-template-columns:minmax(100px,.7fr) minmax(0,1.3fr)}}',
+      '@media(max-width:480px){.source-layout,.analysis-grid,.inspect-layout{grid-template-columns:minmax(0,1fr)} .source-name{margin-top:0} .source-meta .hint{margin-top:3px} .analysis-actions{flex-wrap:wrap} .source-video{height:144px} .inspect-image,.inspector,.inspect-empty{height:144px;min-height:144px} .eyebrow{display:none} .film-help{max-width:100%} .tabs{border-radius:12px} .tabs button{border-radius:9px}}',
+      '</style>',
+      '<main class="app"><div class="workspace">',
+      '<div class="setup">',
+      '<section class="panel" data-stage="sampling"><div class="section-head"><div class="section-title"><span class="step">01</span><h3>采样设置</h3></div><span class="eyebrow">从视频建立镜头</span></div>',
+      '<div class="tabs"><button data-mode="interval" class="active">固定间隔</button><button data-mode="manual">指定帧</button><button data-mode="auto">自动镜头</button></div>',
       '<div data-group="range" class="fields"><label>入点（秒）<input data-start type="number" min="0" step="0.001" value="0"></label><label>出点（秒）<input data-end type="number" step="0.001"></label><label data-group="step">间隔（秒）<input data-step type="number" min="0.001" step="0.1" value="1"></label></div>',
-      '<label data-group="manual" hidden>时间码或秒数（逗号、分号或换行分隔）<textarea data-manual rows="3" placeholder="0, 00:00:02.500, 5"></textarea></label>',
-      '<div data-group="auto" class="fields spaced" hidden><label>切镜阈值<input data-threshold type="number" min="0.05" max="0.95" step="0.01" value="0.28"></label><label>最短镜头（秒）<input data-minshot type="number" min="0.04" max="10" step="0.1" value="0.3"></label><span class="hint">阈值越小越敏感。每次最多扫描 300 秒，结果需人工复核。</span></div>',
+      '<label data-group="manual" hidden>时间码或秒数（逗号、分号或换行分隔）<textarea data-manual rows="2" placeholder="0, 00:00:02.500, 5"></textarea></label>',
+      '<div data-group="auto" class="fields spaced" hidden><label>切镜阈值<input data-threshold type="number" min="0.05" max="0.95" step="0.01" value="0.28"></label><label>最短镜头（秒）<input data-minshot type="number" min="0.04" max="10" step="0.1" value="0.3"></label><span class="hint">阈值越小越敏感，每次最多扫描 300 秒。</span></div>',
       '<div class="row spaced"><button data-apply>应用采样</button><span class="hint" data-selection></span></div></section>',
-      '<section class="panel"><h3>原视频</h3><video data-source-video class="source-video" controls playsinline preload="metadata" aria-label="原视频播放器"></video><p data-source-name class="hint source-name"></p><p data-source-status class="hint" role="status">正在加载原视频…</p></section>',
-      '<section class="panel"><h3>2. 分析设置</h3><label>视觉模型<select data-model></select></label><label class="spaced">分析要求<textarea data-prompt rows="3"></textarea></label>',
-      '<div class="row spaced"><button data-extract>仅抽帧 / 人工填写</button><button data-analyze class="primary">开始 AI 拉片</button></div><p class="hint">每镜头选择一张代表帧。AI 基于静态联系表分析；运镜和声音仅作线索，不等同于完整视频分析。</p></section></div>',
-      '<section class="panel"><div class="row"><h3>视频胶片</h3><button data-left aria-label="向左浏览缩略图">←</button><button data-right aria-label="向右浏览缩略图">→</button><span class="hint">标记同步下方镜头勾选；点击画面仅定位，不改变勾选。可滚轮、触控板或方向键横向浏览。</span></div><div data-filmstrip class="filmstrip" tabindex="0" aria-label="视频胶片横向浏览"></div></section>',
-      '<div class="workbench"><section class="panel"><h3>3. 镜头校正</h3><div class="row"><button data-merge>合并勾选镜头</button><button data-none>取消勾选</button><button data-undo>撤销</button><button data-redo>重做</button></div><div data-shots class="shot-list spaced"></div><p class="hint">勾选用于本批输出（最多 24 镜）。拆分保留左镜 ID，合并保留首镜 ID。更改镜头后需重新抽帧。</p></section>',
-      '<section class="panel"><h3>逐帧检查</h3><img data-inspector class="inspector" alt="当前帧预览" hidden><div class="row spaced"><button data-prev>← 前一帧</button><input data-cursor class="cursor-input" aria-label="定位时间码" value="0"><button data-locate>定位</button><button data-next>后一帧 →</button></div>',
-      '<div class="row spaced"><button data-custom>当前帧作代表</button><button data-split>在当前帧拆分</button></div><div class="row spaced"><span class="hint">当前镜头边界</span><button data-boundary="inPoint:-1">入点 −1 帧</button><button data-boundary="inPoint:1">入点 +1 帧</button><button data-boundary="outPoint:-1">出点 −1 帧</button><button data-boundary="outPoint:1">出点 +1 帧</button></div><p data-inspect-status class="hint">点击镜头后检查首、中、尾帧；前后帧使用实际解码时间戳。</p></section></div>',
-      '<section data-result-section aria-busy="false"><h3>4. 拉片结果与人工复核</h3><div class="result-progress" data-loading hidden role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span data-loading-label></span></div><div class="results" data-results></div></section></div>',
-      '<footer><div class="row footer-actions"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div></footer></main>',
+      '<section class="panel source-panel"><div class="section-head"><div class="section-title"><h3>原视频</h3></div><span class="pill">播放 · 定位</span></div><div class="source-layout"><video data-source-video class="source-video" controls playsinline preload="metadata" aria-label="原视频播放器"></video><div class="source-meta"><span class="eyebrow">当前素材</span><p data-source-name class="hint source-name"></p><p data-source-status class="hint" role="status">正在加载原视频…</p></div></div></section>',
+      '</div>',
+      '<section class="panel film-panel"><div class="section-head"><div class="section-title"><h3>视频胶片</h3><span class="eyebrow">展开每一刻</span></div><div class="film-tools"><button data-view aria-pressed="true" title="切换立体或平铺胶片">立体</button><button data-left aria-label="向左浏览缩略图">←</button><button data-right aria-label="向右浏览缩略图">→</button></div></div><div data-filmstrip class="filmstrip" tabindex="0" aria-label="视频胶片横向浏览"></div><p class="film-help">点击画面定位，勾选状态同步下方镜头。滚轮、触控板或方向键横向浏览。</p></section>',
+      '<div class="workbench" data-stage="correction"><section class="panel correction-panel"><div class="section-head"><div class="section-title"><span class="step">02</span><h3>镜头校正</h3></div><span class="eyebrow">勾选 · 合并 · 拆分</span></div><div class="row"><button data-merge>合并勾选镜头</button><button data-none>取消勾选</button><button data-undo>撤销</button><button data-redo>重做</button></div><div data-shots class="shot-list spaced"></div><p class="hint">每批最多 24 镜；修改边界或代表帧后重新抽帧。</p></section>',
+      '<section class="panel inspection-panel"><div class="section-head"><div class="section-title"><h3>逐帧检查</h3></div><span class="pill">精确到帧</span></div><div class="inspect-layout"><div class="inspect-image"><img data-inspector class="inspector" alt="当前帧预览" hidden><div data-inspector-empty class="inspect-empty"><span aria-hidden="true">▧</span><span>选择胶片或镜头<br>查看当前画面</span></div></div><div class="inspect-controls"><div class="row"><button data-prev>← 前帧</button><input data-cursor class="cursor-input" aria-label="定位时间码" value="0"><button data-locate>定位</button><button data-next>后帧 →</button></div><div class="row spaced"><button data-custom>当前帧作代表</button><button data-split>在当前帧拆分</button></div><div class="hint spaced">当前镜头边界</div><div class="boundary-tools"><button data-boundary="inPoint:-1">入点 −1 帧</button><button data-boundary="inPoint:1">入点 +1 帧</button><button data-boundary="outPoint:-1">出点 −1 帧</button><button data-boundary="outPoint:1">出点 +1 帧</button></div><p data-inspect-status class="hint">按实际解码时间戳检查首、中、尾帧。</p></div></div></section></div>',
+      '<section class="panel analysis-panel" data-stage="analysis"><div class="section-head"><div class="section-title"><span class="step">03</span><h3>拉片分析</h3></div><span data-analysis-summary class="analysis-summary" role="status" aria-live="polite"></span></div><div class="analysis-grid"><label>视觉模型<select data-model></select></label><label>分析要求<textarea data-prompt rows="2"></textarea></label><div class="analysis-actions"><button data-extract>仅抽帧 / 人工填写</button><button data-analyze class="primary">开始 AI 拉片</button></div></div><p class="analysis-hint">每镜头分析一张代表帧。运镜与声音仅作画面线索，不等同于完整视频分析。</p></section>',
+      '<section data-result-section data-stage="results" aria-busy="false"><div class="section-head results-heading"><div class="section-title"><span class="step">04</span><h3>拉片结果与人工复核</h3></div><span class="eyebrow">确认后生成节点或导出</span></div><div class="result-progress" data-loading hidden role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span data-loading-label></span></div><div class="results" data-results></div></section>',
+      '</div><footer><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div><div class="row footer-actions"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div></footer></main>',
     ].join('');
     const el = (name) => root.querySelector('[data-' + name + ']');
     const sourceVideo = el('source-video');
@@ -224,6 +240,13 @@
       root.querySelectorAll('button,input,select,textarea').forEach((control) => { control.disabled = state.busy; });
       el('undo').disabled = state.busy || !state.history.length;
       el('redo').disabled = state.busy || !state.redo.length;
+      const selectedCount = state.shots.filter((shot) => shot.selected).length;
+      el('extract').disabled = state.busy || !selectedCount;
+      el('analyze').disabled = state.busy || !selectedCount || !el('model').value;
+      el('analyze').textContent = '开始 AI 拉片' + (selectedCount ? '（' + selectedCount + ' 镜）' : '');
+      el('analysis-summary').textContent = !state.video ? '正在准备视频…'
+        : state.busy ? '正在处理，请稍候…' : !selectedCount ? '请先勾选要分析的镜头'
+        : '已选 ' + selectedCount + ' 镜 · ' + (el('model').value ? '可开始分析' : '请选择视觉模型');
       ['images', 'shotlist', 'contact', 'json', 'csv'].forEach((name) => { el(name).disabled = state.busy || !state.results.length; });
       el('result-section').setAttribute('aria-busy', String(state.busy));
       el('loading').hidden = !state.busy;
@@ -243,7 +266,11 @@
       if (!response.ok) throw new Error(response.error || '宿主操作失败');
       return response.value;
     }
-    function invalidate() { state.results = []; state.batch = null; renderResults(); }
+    function invalidate() {
+      const hadResults = state.results.length > 0;
+      state.results = []; state.batch = null; renderResults();
+      if (hadResults) status('镜头已更新，请重新抽帧或分析。');
+    }
     function commitShots(shots, record = true, sampling = state.sampling) {
       validateShots(shots, state.video.duration);
       if (record) {
@@ -270,6 +297,7 @@
         sourceVideo.pause(); sourceVideo.currentTime = frame.actualTime;
       }
       el('inspector').hidden = false; el('inspector').src = frame.previewDataUrl;
+      el('inspector-empty').hidden = true;
       el('cursor').value = String(frame.actualTime);
       el('inspect-status').textContent = '实际时间 ' + formatTimecode(frame.actualTime) + ' · 帧时长 ' + frame.frameDuration.toFixed(6) + ' 秒';
       syncFilmstrip();
@@ -286,7 +314,7 @@
           try { commitShots(state.shots.map((s) => s.id === shot.id ? { ...s, selected: check.checked } : s)); }
           catch (error) { check.checked = shot.selected; throw error; }
         }));
-        const select = button(String(i + 1).padStart(2, '0') + ' · ' + shot.id, async () => {
+        const select = button('镜头 ' + String(i + 1).padStart(2, '0'), async () => {
           state.activeId = shot.id; renderShots(); await inspect(sampleTime(shot));
         });
         select.appendChild(element('small', '', formatTimecode(shot.inPoint) + ' → ' + formatTimecode(shot.outPoint) + ' · ' + (shot.outPoint - shot.inPoint).toFixed(3) + 's'));
@@ -306,6 +334,8 @@
     function syncFilmstrip() {
       // 原位更新标记，保留横向滚动位置与键盘焦点。
       const nodes = el('filmstrip').children;
+      const shot = state.shots.find((item) => item.id === state.activeId);
+      const focusIndex = filmstripFocusIndex(state.previews, state.cursor ? state.cursor.actualTime : shot ? sampleTime(shot) : NaN);
       state.previews.forEach((frame, index) => {
         const node = nodes[index];
         if (!node) return;
@@ -313,8 +343,11 @@
         node.classList.toggle('frame--selected', view.selected);
         node.classList.toggle('frame--unselected', !view.selected);
         node.classList.toggle('frame--current', view.current);
+        node.classList.toggle('frame--before', index < focusIndex);
+        node.classList.toggle('frame--focus', index === focusIndex);
         const label = view.shotId ? (view.selected ? '✓ 镜头已选' : '○ 镜头未选') : '— 区间外';
-        node.querySelector('[data-frame-selection]').textContent = label;
+        node.querySelector('[data-frame-selection]').textContent = view.shotId ? (view.selected ? '✓' : '○') : '—';
+        node.querySelector('[data-frame-selection]').title = label;
         node.querySelector('[data-frame-current]').hidden = !view.current;
         node.setAttribute('aria-label', '定位 ' + formatTimecode(frame.actualTime) + ' · ' + label + (view.current ? ' · 查看中' : ''));
         if (view.current) node.setAttribute('aria-current', 'true'); else node.removeAttribute('aria-current');
@@ -322,7 +355,7 @@
     }
     function renderFilmstrip() {
       el('filmstrip').replaceChildren();
-      state.previews.forEach((frame) => {
+      state.previews.forEach((frame, index) => {
         const node = button('', async () => {
           const view = filmstripState(state.shots, frame.actualTime);
           if (view.shotId) { state.activeId = view.shotId; renderShots(); }
@@ -332,7 +365,7 @@
         const image = element('img'); image.alt = '视频预览 ' + formatTimecode(frame.actualTime); image.src = frame.previewDataUrl;
         const selection = element('span', 'frame-selection'); selection.dataset.frameSelection = ''; selection.setAttribute('aria-hidden', 'true');
         const current = element('span', 'frame-current', '查看中'); current.dataset.frameCurrent = ''; current.setAttribute('aria-hidden', 'true'); current.hidden = true;
-        node.append(image, element('span', '', formatTimecode(frame.actualTime)), selection, current); el('filmstrip').appendChild(node);
+        node.append(image, element('span', 'frame-time', formatTimecode(frame.actualTime)), element('span', 'frame-index', String(index + 1).padStart(2, '0')), selection, current); el('filmstrip').appendChild(node);
       });
       syncFilmstrip();
     }
@@ -469,6 +502,7 @@
     const parameters = props.parameters || {};
     el('model').value = models.some((m) => m.id === parameters.model) ? parameters.model : '';
     el('prompt').value = parameters.prompt || DEFAULT_PROMPT; el('prompt').maxLength = 8000;
+    el('model').addEventListener('change', controls);
     root.querySelectorAll('[data-mode]').forEach((tab) => tab.addEventListener('click', () => {
       if (state.busy) return; state.mode = tab.dataset.mode;
       root.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === tab));
@@ -519,7 +553,15 @@
       status('已保存到项目：' + saved.fileName);
     });
     const strip = el('filmstrip');
-    const scrollStrip = (delta) => strip.scrollBy({ left: delta, behavior: 'smooth' });
+    el('view').addEventListener('click', () => {
+      if (state.busy) return;
+      state.deckFlat = !state.deckFlat;
+      strip.classList.toggle('filmstrip--flat', state.deckFlat);
+      el('view').textContent = state.deckFlat ? '平铺' : '立体';
+      el('view').setAttribute('aria-pressed', String(!state.deckFlat));
+    });
+    const scrollStrip = (delta) => strip.scrollBy({ left: delta,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
     el('left').addEventListener('click', () => scrollStrip(-Math.max(250, strip.clientWidth * 0.7)));
     el('right').addEventListener('click', () => scrollStrip(Math.max(250, strip.clientWidth * 0.7)));
     strip.addEventListener('wheel', (event) => {
