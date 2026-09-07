@@ -5,10 +5,57 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../ui.js', import.meta.url), 'utf8');
 const exports = {};
-vm.runInNewContext(source, { window: { __AI_CANVAS_PLUGIN_HOST__: { exports } } });
+vm.runInNewContext(source, { window: { __AI_CANVAS_PLUGIN_HOST__: { exports } }, Blob, Uint8Array, atob });
 const api = exports.FrameReviewLogic;
 const shot = (id, start, end, selected = true) => ({ id, inPoint: start, outPoint: end, selected, role: 'middle' });
 const json = (value) => JSON.parse(JSON.stringify(value));
+
+test('原视频按有界分段完整组装，保留原文件字节和 MIME', async () => {
+  const bytes = Buffer.alloc(400_003);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251;
+  const resource = { resourceId: 'opaque-video', size: bytes.length, mediaType: 'video/mp4' };
+  const calls = [], progress = [];
+  const blob = await api.readSourceVideo(resource, async (request) => {
+    calls.push(request);
+    assert.ok(Math.ceil(request.length / 3) * 4 < 256_000);
+    return { resource, offset: request.offset, bytes: request.length, base64: bytes.subarray(request.offset, request.offset + request.length).toString('base64') };
+  }, () => false, (value) => progress.push(value));
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].offset, 0); assert.equal(calls[1].offset, calls[0].length);
+  assert.deepEqual(Buffer.from(await blob.arrayBuffer()), bytes);
+  assert.equal(blob.type, 'video/mp4'); assert.equal(progress.at(-1), 100);
+});
+
+test('视频读取拒绝过大资源、错位/截断回包和外部会话资源', async () => {
+  const resource = { resourceId: 'opaque-video', size: 1, mediaType: 'video/mp4' };
+  let reads = 0;
+  await assert.rejects(api.readSourceVideo({ ...resource, size: 16 * 1024 * 1024 + 1 }, () => { reads++; }, () => false, () => {}), /16 MiB/);
+  assert.equal(reads, 0);
+  const valid = { resource, offset: 0, bytes: 1, base64: 'AA==' };
+  for (const patch of [{ offset: 1 }, { bytes: 0 }, { base64: '' }, { resource: { ...resource, resourceId: 'other' } }]) {
+    await assert.rejects(api.readSourceVideo(resource, async () => ({ ...valid, ...patch }), () => false, () => {}), /读取不完整/);
+  }
+});
+
+test('关闭界面后不再请求分段或生成迟到播放器数据', async () => {
+  let disposed = false, reads = 0, progress = 0;
+  const resource = { resourceId: 'opaque-video', size: 300_000, mediaType: 'video/mp4' };
+  await assert.rejects(api.readSourceVideo(resource, async (request) => {
+    reads++; disposed = true;
+    return { resource, offset: 0, bytes: request.length, base64: Buffer.alloc(request.length).toString('base64') };
+  }, () => disposed, () => { progress++; }), /界面已关闭/);
+  assert.equal(reads, 1); assert.equal(progress, 0);
+});
+
+test('原视频位于采样和分析之间，支持窄窗口、手动播放与清理', () => {
+  assert.ok(source.indexOf('<h3>1. 选择采样方式') < source.indexOf('<h3>原视频'));
+  assert.ok(source.indexOf('<h3>原视频') < source.indexOf('<h3>2. 分析设置'));
+  assert.match(source, /controls playsinline preload="metadata"/);
+  assert.doesNotMatch(source, /autoplay/);
+  assert.match(source, /@media\(max-width:980px\)\{\.setup\{grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(source, /sourceVideo\.pause\(\); sourceVideo\.removeAttribute\('src'\); sourceVideo\.load\(\)/);
+  assert.match(source, /URL\.revokeObjectURL\(sourceVideoUrl\)/);
+});
 
 test('时间码拒绝空值、负数和无效分秒，保留真实精度', () => {
   assert.equal(api.parseTimecode('01:02.125'), 62.125);

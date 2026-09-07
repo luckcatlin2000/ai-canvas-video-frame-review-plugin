@@ -121,11 +121,35 @@
     return '\uFEFF' + [columns.map(csvCell).join(','), ...report.frames.map((frame) =>
       columns.map((key) => csvCell(key === 'sourceVideoNodeId' ? report.source.nodeId : key === 'sourceVideoName' ? report.source.name : frame[key])).join(','))].join('\r\n');
   }
-  const logic = { parseTimecode, sampleTime, filmstripState, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv };
+  async function readSourceVideo(resource, read, isDisposed, onProgress) {
+    if (!resource || !String(resource.mediaType).startsWith('video/') || !Number.isSafeInteger(resource.size) || resource.size <= 0) {
+      throw new Error('当前节点没有可播放的视频资源');
+    }
+    if (resource.size > 16 * 1024 * 1024) throw new Error('原视频超过 16 MiB，仍可使用胶片和逐帧检查');
+    // Base64 需低于宿主单字符串 256,000 字符上限，分段仅在此会话内组装。
+    const parts = [], chunkBytes = 180 * 1024;
+    for (let offset = 0; offset < resource.size; offset += chunkBytes) {
+      if (isDisposed()) throw new Error('界面已关闭');
+      const length = Math.min(chunkBytes, resource.size - offset);
+      const result = await read({ type: 'resource.readRange', resourceId: resource.resourceId, offset, length });
+      if (isDisposed()) throw new Error('界面已关闭');
+      if (!result || result.offset !== offset || result.bytes !== length || typeof result.base64 !== 'string'
+        || result.base64.length !== Math.ceil(length / 3) * 4
+        || !result.resource || result.resource.resourceId !== resource.resourceId || result.resource.size !== resource.size) {
+        throw new Error('原视频读取不完整，请关闭后重新打开');
+      }
+      const binary = atob(result.base64);
+      if (binary.length !== length) throw new Error('原视频数据长度不匹配');
+      parts.push(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
+      onProgress(Math.round((offset + length) / resource.size * 100));
+    }
+    return new Blob(parts, { type: resource.mediaType });
+  }
+  const logic = { parseTimecode, sampleTime, filmstripState, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv, readSourceVideo };
   window.__AI_CANVAS_PLUGIN_HOST__.exports.FrameReviewLogic = logic;
 
   window.__AI_CANVAS_PLUGIN_HOST__.exports.VideoFrameReview = function mount(root, props) {
-    let disposed = false, serial = 0;
+    let disposed = false, serial = 0, sourceVideoUrl = '';
     const prefix = 'shot-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7) + '-';
     const newId = () => prefix + (++serial);
     const state = { video: null, previews: [], shots: [], activeId: '', cursor: null, results: [], batch: null, sampling: 'interval',
@@ -138,7 +162,8 @@
       '*{box-sizing:border-box} html,body,#root{width:100%;height:100%;min-width:0;margin:0} body{overflow:auto;background:var(--bg);color:var(--text);font:13px "Segoe UI","Microsoft YaHei",sans-serif}',
       'button,input,select,textarea{font:inherit;color:inherit} button{cursor:pointer} button:disabled{opacity:.45;cursor:not-allowed} .app [hidden]{display:none}',
       '.app{height:100%;min-height:0;min-width:0;display:flex;flex-direction:column} .workspace{flex:1;min-height:0;min-width:0;overflow:auto;overscroll-behavior:contain;padding:8px;scrollbar-gutter:stable}',
-      '.setup,.workbench{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px} .panel{min-width:0;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:8px;margin-bottom:8px}',
+      '.setup,.workbench{display:grid;gap:8px} .setup{grid-template-columns:minmax(0,1fr) minmax(0,.7fr) minmax(0,1fr)} .workbench{grid-template-columns:repeat(2,minmax(0,1fr))} .panel{min-width:0;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:8px;margin-bottom:8px}',
+      '.source-video{display:block;width:100%;height:210px;object-fit:contain;background:var(--bg);border-radius:6px} .source-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} @media(max-width:980px){.setup{grid-template-columns:minmax(0,1fr)}}',
       'h3{margin:0 0 6px;font-size:14px} .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .spaced{margin-top:6px} .hint{color:var(--muted);font-size:12px;line-height:1.5;overflow-wrap:anywhere} .panel p.hint{margin:6px 0 0} .error{color:var(--danger)}',
       'button{min-height:28px;border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;line-height:18px;background:var(--card)} button:hover:not(:disabled){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--card))} button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}',
       '.active,.primary{border-color:var(--accent);color:var(--accent2);background:color-mix(in srgb,var(--accent) 18%,var(--card))} .tabs{display:flex;gap:4px;margin-bottom:6px} .tabs button{flex:1;min-width:0}',
@@ -156,6 +181,7 @@
       '<label data-group="manual" hidden>时间码或秒数（逗号、分号或换行分隔）<textarea data-manual rows="3" placeholder="0, 00:00:02.500, 5"></textarea></label>',
       '<div data-group="auto" class="fields spaced" hidden><label>切镜阈值<input data-threshold type="number" min="0.05" max="0.95" step="0.01" value="0.28"></label><label>最短镜头（秒）<input data-minshot type="number" min="0.04" max="10" step="0.1" value="0.3"></label><span class="hint">阈值越小越敏感。每次最多扫描 300 秒，结果需人工复核。</span></div>',
       '<div class="row spaced"><button data-apply>应用采样</button><span class="hint" data-selection></span></div></section>',
+      '<section class="panel"><h3>原视频</h3><video data-source-video class="source-video" controls playsinline preload="metadata" aria-label="原视频播放器"></video><p data-source-name class="hint source-name"></p><p data-source-status class="hint" role="status">正在加载原视频…</p></section>',
       '<section class="panel"><h3>2. 分析设置</h3><label>视觉模型<select data-model></select></label><label class="spaced">分析要求<textarea data-prompt rows="3"></textarea></label>',
       '<div class="row spaced"><button data-extract>仅抽帧 / 人工填写</button><button data-analyze class="primary">开始 AI 拉片</button></div><p class="hint">每镜头选择一张代表帧。AI 基于静态联系表分析；运镜和声音仅作线索，不等同于完整视频分析。</p></section></div>',
       '<section class="panel"><div class="row"><h3>视频胶片</h3><button data-left aria-label="向左浏览缩略图">←</button><button data-right aria-label="向右浏览缩略图">→</button><span class="hint">标记同步下方镜头勾选；点击画面仅定位，不改变勾选。可滚轮、触控板或方向键横向浏览。</span></div><div data-filmstrip class="filmstrip" tabindex="0" aria-label="视频胶片横向浏览"></div></section>',
@@ -166,6 +192,29 @@
       '<footer><div class="row footer-actions"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div></footer></main>',
     ].join('');
     const el = (name) => root.querySelector('[data-' + name + ']');
+    const sourceVideo = el('source-video');
+    el('source-name').textContent = sourceName; el('source-name').title = sourceName;
+    sourceVideo.addEventListener('loadedmetadata', () => {
+      if (disposed) return;
+      el('source-status').textContent = '播放 / 暂停、拖动进度条查看原视频';
+      if (state.cursor) sourceVideo.currentTime = state.cursor.actualTime;
+    });
+    sourceVideo.addEventListener('error', () => {
+      if (!disposed) el('source-status').textContent = '当前环境无法播放此视频格式，仍可使用胶片和逐帧检查';
+    });
+    async function loadSourceVideo() {
+      try {
+        const blob = await readSourceVideo(videoResource, effect, () => disposed, (progress) => {
+          el('source-status').textContent = '正在加载原视频… ' + progress + '%';
+        });
+        if (disposed) return;
+        sourceVideoUrl = URL.createObjectURL(blob);
+        sourceVideo.src = sourceVideoUrl;
+        el('source-status').textContent = '正在准备播放…';
+      } catch (error) {
+        if (!disposed) el('source-status').textContent = error instanceof Error ? error.message : '原视频加载失败';
+      }
+    }
     const listen = (name, fn, loadingMessage) => el(name).addEventListener('click', () => void action(fn, loadingMessage));
     const status = (message, error) => {
       el('status').textContent = message; el('status').classList.toggle('error', Boolean(error));
@@ -217,6 +266,9 @@
     async function inspect(time, direction = 0, boundary = false) {
       const frame = await effect({ type: 'video.inspectFrame', resourceId: videoResource.resourceId, time, direction, boundary });
       state.cursor = frame;
+      if (sourceVideoUrl && sourceVideo.readyState >= 1) {
+        sourceVideo.pause(); sourceVideo.currentTime = frame.actualTime;
+      }
       el('inspector').hidden = false; el('inspector').src = frame.previewDataUrl;
       el('cursor').value = String(frame.actualTime);
       el('inspect-status').textContent = '实际时间 ' + formatTimecode(frame.actualTime) + ' · 帧时长 ' + frame.frameDuration.toFixed(6) + ' 秒';
@@ -490,7 +542,14 @@
       el('end').value = String(state.video.duration);
       el('step').value = String(state.video.duration / 8);
       renderFilmstrip(); await applySampling();
+      if (state.previews[0]) sourceVideo.poster = state.previews[0].previewDataUrl;
+      await loadSourceVideo();
     });
-    return function cleanup() { disposed = true; window.removeEventListener('ai-canvas-theme-change', themeListener); root.replaceChildren(); };
+    return function cleanup() {
+      disposed = true; window.removeEventListener('ai-canvas-theme-change', themeListener);
+      sourceVideo.pause(); sourceVideo.removeAttribute('src'); sourceVideo.load();
+      if (sourceVideoUrl) { URL.revokeObjectURL(sourceVideoUrl); sourceVideoUrl = ''; }
+      root.replaceChildren();
+    };
   };
 })();
