@@ -50,10 +50,10 @@ test('关闭界面后不再请求分段或生成迟到播放器数据', async ()
 test('准备、校正、分析、复核按顺序展示，保留手动播放和清理', () => {
   const stages = ['sampling', 'correction', 'analysis', 'results'].map((stage) => source.indexOf('data-stage="' + stage + '"'));
   assert.ok(stages.every((offset, index) => offset >= 0 && (!index || offset > stages[index - 1])));
-  assert.ok(source.indexOf('<h3>原视频') < stages[1]);
+  assert.ok(source.indexOf('data-source-video') < stages[0]);
   assert.match(source, /controls playsinline preload="metadata"/);
   assert.doesNotMatch(source, /autoplay/);
-  assert.match(source, /@media\(max-width:760px\)\{\.setup,\.workbench\{grid-template-columns:minmax\(0,1fr\)\}/);
+  assert.match(source, /@media\(max-width:900px\)\{\.studio\{[^}]*grid-template-columns:minmax\(0,1fr\)/);
   assert.match(source, /sourceVideo\.pause\(\); sourceVideo\.removeAttribute\('src'\); sourceVideo\.load\(\)/);
   assert.match(source, /URL\.revokeObjectURL\(sourceVideoUrl\)/);
 });
