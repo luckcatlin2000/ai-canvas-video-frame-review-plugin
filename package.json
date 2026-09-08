@@ -1,6 +1,6 @@
 {
   "name": "ai-canvas-video-frame-review-plugin",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "AI-Canvas 逐帧拉片视频节点工具插件",

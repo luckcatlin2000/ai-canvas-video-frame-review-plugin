@@ -122,10 +122,10 @@
     return '"' + text.replace(/"/g, '""') + '"';
   }
   function reportCsv(report) {
-    const columns = ['sourceVideoNodeId', 'sourceVideoName', 'shotId', 'inPoint', 'outPoint', 'duration',
+    const columns = ['sourceVideoNodeId', 'sourceVideoName', 'imageRepresentation', 'shotId', 'inPoint', 'outPoint', 'duration',
       'sampleRole', 'requestedTime', 'actualTime', 'frameDuration', ...FIELDS, 'confidence', 'reviewStatus', 'overrideFields', 'aiOriginal', 'analysisError'];
     return '\uFEFF' + [columns.map(csvCell).join(','), ...report.frames.map((frame) =>
-      columns.map((key) => csvCell(key === 'sourceVideoNodeId' ? report.source.nodeId : key === 'sourceVideoName' ? report.source.name : frame[key])).join(','))].join('\r\n');
+      columns.map((key) => csvCell(key === 'sourceVideoNodeId' ? report.source.nodeId : key === 'sourceVideoName' ? report.source.name : key === 'imageRepresentation' ? report.imageRepresentation || 'original' : frame[key])).join(','))].join('\r\n');
   }
   async function readSourceVideo(resource, read, isDisposed, onProgress) {
     if (!resource || !String(resource.mediaType).startsWith('video/') || !Number.isSafeInteger(resource.size) || resource.size <= 0) {
@@ -151,7 +151,88 @@
     }
     return new Blob(parts, { type: resource.mediaType });
   }
-  const logic = { parseTimecode, sampleTime, filmstripState, filmstripFocusIndex, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv, readSourceVideo };
+  function lineArtMatches(frame, art) {
+    return Boolean(art && art.resourceId === frame.resourceId && art.representation === 'lineart'
+      && Number.isSafeInteger(art.width) && Number.isSafeInteger(art.height)
+      && art.width > 0 && art.height > 0 && art.width <= 1024 && art.height <= 1024
+      && typeof art.dataUrl === 'string' && art.dataUrl.length <= 256000
+      && /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(art.dataUrl));
+  }
+  function hasLineArtBatch(frames, lineArt) {
+    return frames.length > 0 && frames.every((frame) => lineArtMatches(frame, lineArt.get(frame.key)));
+  }
+  async function requestLineArt(frame, runEffect, isCurrent) {
+    if (!isCurrent()) throw new Error('线稿批次已失效');
+    let value;
+    try {
+      value = await runEffect({ type: 'image.lineArt', resourceId: frame.resourceId });
+    } catch (error) {
+      if (!isCurrent()) throw new Error('线稿批次已失效');
+      const message = error && typeof error.message === 'string' ? error.message : String(error);
+      if (message === '插件请求了不支持的宿主操作') {
+        throw new Error('当前 AI-Canvas 版本不支持线稿资源，请更新主应用后重新打开插件。');
+      }
+      throw error;
+    }
+    if (!isCurrent()) throw new Error('线稿批次已失效');
+    const art = value && { resourceId: value.resourceId, representation: value.representation,
+      width: value.width, height: value.height, dataUrl: value.previewDataUrl, actualTime: frame.actualTime };
+    if (!lineArtMatches(frame, art)) throw new Error('宿主返回的线稿资源无效，请更新主应用后重新打开插件。');
+    return art;
+  }
+  function visibleOutput(lineArtView) {
+    const label = lineArtView ? '线稿' : '原图';
+    return { imageRepresentation: lineArtView ? 'lineart' : 'original',
+      images: '生成' + label + '节点', shotlist: '生成' + label + '分镜表节点', contact: '导出' + label + '联系表' };
+  }
+  function buildSubmission(outputMode, videoDuration, frames, lineArtView, lineArt) {
+    if (!['images', 'shotlist'].includes(outputMode)) throw new Error('节点输出类型无效');
+    if (!Array.isArray(frames) || !frames.length || frames.length > MAX_FRAMES) throw new Error('请先完整抽取当前选择的镜头');
+    if (frames.some((frame) => frame.analysisError || frame.reviewStatus === 'edited')) throw new Error('请先确认缺失结果和人工修改的复核状态');
+    if (lineArtView && !hasLineArtBatch(frames, lineArt)) throw new Error('当前线稿批次不完整，请重新转换后再生成节点');
+    return { outputMode, videoDuration, imageRepresentation: visibleOutput(lineArtView).imageRepresentation,
+      frames: frames.map((frame) => {
+        const image = lineArtView ? lineArt.get(frame.key) : frame;
+        return { ...publicFrame(frame), resourceId: frame.resourceId, width: image.width, height: image.height };
+      }) };
+  }
+  async function convertLineArtBatch(frames, convert, isCurrent, onProgress) {
+    if (!Array.isArray(frames) || !frames.length || frames.length > MAX_FRAMES
+      || new Set(frames.map((frame) => frame.key)).size !== frames.length) throw new Error('线稿批次必须包含 1–24 张不同的画面');
+    const converted = new Map();
+    for (let index = 0; index < frames.length; index++) {
+      if (!isCurrent()) throw new Error('线稿批次已失效');
+      onProgress(index + 1, frames.length);
+      const value = await convert(frames[index]);
+      if (!isCurrent()) throw new Error('线稿批次已失效');
+      converted.set(frames[index].key, value);
+    }
+    return converted;
+  }
+  function lineArtSvg(images, title) {
+    if (!Array.isArray(images) || !images.length || images.length > MAX_FRAMES) throw new Error('线稿联系表必须包含 1–24 张画面');
+    const escape = (text) => String(text).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[character]));
+    const columns = Math.min(images.length, 4), width = columns * 320 + 32, height = Math.ceil(images.length / columns) * 246 + 66;
+    const parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '">',
+      '<title>' + escape(title) + '</title><rect width="100%" height="100%" fill="white"/>',
+      '<text x="16" y="30" fill="black" font-family="sans-serif" font-size="16">逐帧拉片 · 本地线稿联系表</text>'];
+    images.forEach((image, index) => {
+      if (typeof image.dataUrl !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(image.dataUrl)
+        || !Number.isFinite(image.actualTime) || image.actualTime < 0) throw new Error('线稿图像或时间码无效');
+      const x = 16 + (index % columns) * 320, y = 50 + Math.floor(index / columns) * 246;
+      parts.push('<image x="' + x + '" y="' + y + '" width="304" height="208" preserveAspectRatio="xMidYMid meet" href="' + image.dataUrl + '"/>',
+        '<text x="' + x + '" y="' + (y + 230) + '" fill="black" font-family="sans-serif" font-size="13">'
+        + String(index + 1).padStart(2, '0') + ' · ' + formatTimecode(image.actualTime) + '</text>');
+    });
+    parts.push('</svg>');
+    return parts.join('');
+  }
+  function checkedLineArtSvg(content) {
+    if (content.length > 256000) throw new Error('线稿联系表超过导出上限，请减少镜头后再导出');
+    return content;
+  }
+
+  const logic = { parseTimecode, sampleTime, filmstripState, filmstripFocusIndex, validateShots, splitShot, mergeShots, moveBoundary, parseAnalysisJson, mergeAnalysis, publicFrame, reportCsv, readSourceVideo, requestLineArt, hasLineArtBatch, visibleOutput, buildSubmission, convertLineArtBatch, lineArtSvg, checkedLineArtSvg };
   window.__AI_CANVAS_PLUGIN_HOST__.exports.FrameReviewLogic = logic;
 
   window.__AI_CANVAS_PLUGIN_HOST__.exports.VideoFrameReview = function mount(root, props) {
@@ -159,13 +240,13 @@
     const prefix = 'shot-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7) + '-';
     const newId = () => prefix + (++serial);
     const state = { video: null, previews: [], shots: [], activeId: '', cursor: null, results: [], batch: null, sampling: 'interval',
-      busy: false, loadingMessage: '', mode: 'interval', deckFlat: false, history: [], redo: [] };
+      lineArt: new Map(), lineArtView: false, busy: false, loadingMessage: '', mode: 'interval', deckFlat: false, history: [], redo: [] };
     let appliedSamplingSignature = '';
     const videoResource = (props.resources && props.resources.self || []).find((r) => String(r.mediaType || '').startsWith('video/'));
     const sourceName = String(props.node && props.node.data && props.node.data.label || videoResource && videoResource.displayName || '来源视频').slice(0, 240);
     root.innerHTML = [
       '<style>',
-      ':root{color-scheme:dark;--bg:#0d0d12;--panel:#191920;--card:#24242e;--inset:#121218;--line:#34343f;--edge:#51515f;--text:#ededf3;--muted:#a8a7b8;--soft:#858495;--accent:#8776e9;--accent2:#c7bbff;--on-accent:#fff;--danger:#ff8a9a;--success:#91bcae;--shadow:0 18px 45px rgba(0,0,0,.24)}',
+      ':root{color-scheme:dark;--bg:#0d0d12;--panel:#191920;--card:#24242e;--inset:#121218;--line:#34343f;--edge:#51515f;--text:#ededf3;--muted:#a8a7b8;--soft:#858495;--accent:#8776e9;--accent2:#c7bbff;--on-accent:#fff;--paper:#fff;--danger:#ff8a9a;--success:#91bcae;--shadow:0 18px 45px rgba(0,0,0,.24)}',
       ':root[data-theme="light"]{color-scheme:light;--bg:#eeedf3;--panel:#faf9fc;--card:#e7e4f0;--inset:#f1eff6;--line:#d6d2df;--edge:#b5aebf;--text:#36313f;--muted:#736c80;--soft:#847c90;--accent:#7462cc;--accent2:#6553b6;--on-accent:#fff;--danger:#b7465a;--success:#547d6e;--shadow:0 18px 45px rgba(66,54,89,.09)}',
       '*{box-sizing:border-box;scrollbar-width:none} *::-webkit-scrollbar{display:none;width:0;height:0} html,body,#root{width:100%;height:100%;min-width:0;margin:0} body{overflow:auto;background:var(--bg);color:var(--text);font:13px "Segoe UI","Microsoft YaHei",sans-serif}',
       'button,input,select,textarea{font:inherit;color:inherit} button{cursor:pointer} button:disabled{opacity:.42;cursor:not-allowed} .app [hidden]{display:none}',
@@ -180,8 +261,8 @@
       '.viewer-stage{position:relative;flex:1;min-height:0;overflow:hidden;border-radius:12px;background:var(--inset)} .video-view,.still-view{height:100%;min-height:0} .source-video{display:block;width:100%;height:100%;object-fit:contain;background:var(--inset)} .inspector{width:100%;height:100%;object-fit:contain;display:block} .inspect-empty{height:100%;display:grid;place-content:center;text-align:center;gap:10px;color:var(--soft);font-size:12px} .inspect-empty span:first-child{font-size:32px;color:var(--edge)} .viewer-caption{position:absolute;bottom:12px;left:12px;border:1px solid var(--edge);background:var(--panel);color:var(--text);border-radius:7px;padding:5px 8px;font-size:11px;font-variant-numeric:tabular-nums}',
       '.source-meta{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 2px 0;min-width:0} .source-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);flex:0 1 55%;margin:0;font-size:11px} .source-meta [data-source-status]{margin:0;font-size:10px;text-align:right;color:var(--soft);flex:1}',
       '.film-panel{grid-column:1;grid-row:2;display:flex;flex-direction:column;padding:0;min-width:0;overflow:hidden} .film-panel .section-head{margin:0 4px 0} .film-panel h3{font-size:12px} .film-tools{display:flex;gap:2px;align-items:center;padding:2px;border:1px solid var(--line);border-radius:999px;background:var(--panel)} .film-tools button{border-color:transparent;background:transparent;border-radius:999px;min-width:28px;min-height:24px;padding:2px 8px} .film-tools [aria-pressed="true"]{color:var(--accent2);background:var(--card)} .film-help{margin:0 4px;font-size:10px;color:var(--soft)}',
-      '.filmstrip{display:flex;gap:0;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:15px 18px 16px;isolation:isolate;justify-content:safe center;scroll-padding-inline:20px;background:radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 7%,transparent),transparent 68%)} .frame{position:relative;flex:0 0 146px;height:162px;min-height:162px;margin-right:-46px;overflow:hidden;padding:3px;display:flex;flex-direction:column;gap:0;border:1px solid var(--edge);border-radius:10px;background:var(--card);box-shadow:2px 1px 0 var(--line),4px 2px 0 var(--inset),6px 12px 18px color-mix(in srgb,var(--bg) 80%,transparent),inset 0 1px 0 color-mix(in srgb,var(--text) 16%,transparent);transform:perspective(850px) rotateY(-40deg) translateY(3px);transform-origin:center;transition:transform .24s,box-shadow .24s,border-color .2s;z-index:1} .frame::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:linear-gradient(110deg,color-mix(in srgb,var(--text) 10%,transparent),transparent 15%,transparent 96%,color-mix(in srgb,var(--text) 12%,transparent))} .frame:last-child{margin-right:0} .frame img{width:100%;height:126px;object-fit:contain;background:var(--inset);border-radius:7px 7px 3px 3px;pointer-events:none} .frame-time{padding:7px 2px 2px;font-size:10px;font-variant-numeric:tabular-nums;color:var(--muted);letter-spacing:.02em}',
-      '.frame--before{transform:perspective(850px) rotateY(40deg) translateY(3px)} .frame--focus,.frame:focus-visible{transform:perspective(850px) rotateY(0) translateY(-3px);z-index:4;border-color:var(--accent2);background:var(--card);box-shadow:2px 2px 0 var(--line),0 12px 26px color-mix(in srgb,var(--bg) 85%,transparent)} .frame:not(.frame--focus):hover:not(:disabled){border-color:var(--text)} .frame:focus-visible{z-index:5} .frame--unselected img{opacity:.58} .frame-index,.frame-selection,.frame-current{position:absolute;z-index:1;background:var(--inset);color:var(--text);font-size:10px;line-height:16px;padding:0 4px;border-radius:4px} .frame-index{top:7px;left:7px;font-variant-numeric:tabular-nums} .frame-selection{top:7px;right:7px} .frame--selected .frame-selection{color:var(--accent2)} .frame-current{bottom:34px;left:7px;color:var(--accent2)} .filmstrip--flat{gap:8px} .filmstrip--flat .frame{margin:0;transform:none;flex-basis:146px} .filmstrip--flat .frame--focus{border-color:var(--accent2)}',
+      '.filmstrip{display:flex;gap:0;min-width:0;width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:15px 18px 16px;isolation:isolate;justify-content:safe center;scroll-padding-inline:20px;background:transparent} .frame{position:relative;flex:0 0 146px;height:162px;min-height:162px;margin-right:-46px;overflow:hidden;padding:3px;display:flex;flex-direction:column;gap:0;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:none;transform:perspective(850px) rotateY(-40deg) translateY(3px);transform-origin:center;transition:transform .24s,border-color .2s;z-index:1} .frame:last-child{margin-right:0} .frame img{width:100%;height:126px;object-fit:contain;background:var(--inset);border-radius:7px 7px 3px 3px;pointer-events:none} .frame-time{padding:7px 2px 2px;font-size:10px;font-variant-numeric:tabular-nums;color:var(--muted);letter-spacing:.02em}',
+      '.frame--before{transform:perspective(850px) rotateY(40deg) translateY(3px)} .frame--focus,.frame:focus-visible{transform:perspective(850px) rotateY(0) translateY(-3px);z-index:4;border-color:color-mix(in srgb,var(--accent) 65%,var(--line));background:var(--panel)} .frame:not(.frame--focus):hover:not(:disabled){border-color:var(--edge);background:var(--panel)} .frame:focus-visible{z-index:5} .frame--unselected img{opacity:.58} .frame-index,.frame-selection,.frame-current{position:absolute;z-index:1;background:var(--inset);color:var(--text);font-size:10px;line-height:16px;padding:0 4px;border-radius:4px} .frame-index{top:7px;left:7px;font-variant-numeric:tabular-nums} .frame-selection{top:7px;right:7px} .frame--selected .frame-selection{color:var(--accent2)} .frame-current{bottom:34px;left:7px;color:var(--accent2)} .filmstrip--flat{gap:8px} .filmstrip--flat .frame{margin:0;transform:none;flex-basis:146px}',
       '.control-panel{grid-column:2;grid-row:1/3;display:flex;flex-direction:column;min-height:0;overflow:hidden;border:1px solid color-mix(in srgb,var(--edge) 60%,var(--line));border-radius:22px;background:linear-gradient(155deg,color-mix(in srgb,var(--accent) 9%,var(--panel)),var(--panel) 42%);box-shadow:inset 0 1px 0 color-mix(in srgb,var(--text) 7%,transparent),var(--shadow)} .control-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:18px 18px 14px} .control-header strong{font-size:14px;font-weight:600} .control-header .pill{font-size:10px;border:0;background:var(--card)}',
       '.workflow-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin:0 14px 4px;padding:4px;gap:3px;background:var(--inset);border:1px solid var(--line);border-radius:12px} .workflow-tabs button{display:flex;align-items:center;justify-content:center;gap:6px;min-height:34px;border-color:transparent;background:transparent;color:var(--soft);border-radius:8px} .workflow-tabs button span{font-size:10px;font-variant-numeric:tabular-nums;opacity:.75} .workflow-tabs [aria-selected="true"]{background:var(--card);color:var(--text);border-color:var(--line);box-shadow:0 2px 4px color-mix(in srgb,var(--bg) 30%,transparent)}',
       '.workflow-body{flex:1;min-height:0;overflow:auto;padding:18px;display:flex;flex-direction:column} .workflow-page{display:flex;flex-direction:column;min-height:100%;gap:14px} .workflow-page .section-head{margin-bottom:0} .workflow-page h3{font-size:20px;letter-spacing:.02em;font-weight:600} .stage-description{margin:0;color:var(--soft);font-size:11px;line-height:1.7} .stage-next{width:100%;min-height:36px;margin-top:auto;text-align:left;display:flex;align-items:center;justify-content:space-between;border-color:var(--line);background:var(--card)} .stage-next span{color:var(--accent2)}',
@@ -189,7 +270,7 @@
       '.correction-panel{gap:10px} .correction-panel h3{font-size:18px} .shot-tools{gap:4px} .shot-tools button{font-size:11px;padding-inline:6px} .shot-list{max-height:174px;min-height:74px;overflow:auto;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--inset)} .shot{display:flex;gap:5px;align-items:center;margin:0;padding:4px 6px;border:0;border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent);border-radius:0;background:transparent} .shot:last-child{border-bottom:0} .shot.active{background:var(--card);box-shadow:inset 2px 0 0 var(--accent)} .shot button{flex:1;min-width:0;text-align:left;overflow-wrap:anywhere;border-color:transparent;background:transparent;padding:2px 3px;font-size:11px} .shot select{width:63px;background:transparent;border-color:transparent;padding-inline:2px;font-size:11px} .shot select:hover{border-color:var(--line)} .shot small{display:block;color:var(--soft);margin-top:2px;font-size:9px;font-variant-numeric:tabular-nums;line-height:1.5}',
       '.inspect-controls{padding-top:10px;border-top:1px solid var(--line)} .inspect-controls .section-head{margin-bottom:9px} .inspect-controls h4{margin:0;font-size:12px;font-weight:500} .cursor-input{flex:1;min-width:40px;max-width:110px;font-variant-numeric:tabular-nums} .inspect-controls .row{gap:4px} .inspect-controls button{font-size:11px;padding-inline:6px} .boundary-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin-top:6px} .inspect-controls .hint{font-size:10px;margin:6px 0 0}',
       '.batch-summary{display:flex;align-items:center;gap:13px;padding:12px 14px;background:color-mix(in srgb,var(--accent) 8%,var(--inset));border:1px solid color-mix(in srgb,var(--accent) 22%,var(--line));border-radius:12px} .batch-count{font-size:30px;line-height:1.1;font-weight:500;letter-spacing:-.05em;font-variant-numeric:tabular-nums;color:var(--accent2)} .batch-caption{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text)} .batch-caption small{font-size:10px;color:var(--soft)} .analysis-grid{display:flex;flex-direction:column;gap:15px} .analysis-grid select{height:36px} .analysis-grid textarea{min-height:130px;padding:10px;line-height:1.8;font-size:12px} .analysis-actions{display:flex;flex-direction:column;gap:7px;margin-top:auto;padding-top:4px} .analysis-actions .primary{min-height:40px;border-radius:10px;box-shadow:0 4px 12px color-mix(in srgb,var(--accent) 13%,transparent)} .analysis-actions .quiet{font-size:11px} .analysis-summary{display:block;color:var(--muted);font-size:11px;line-height:1.6;min-height:18px} .analysis-hint{font-size:10px;color:var(--soft);line-height:1.65;margin:0} .control-footer{display:flex;gap:6px;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--line);font-size:10px;color:var(--soft)} .control-footer button{font-size:11px;min-height:26px}',
-      '.results-section{padding-top:24px;scroll-margin-top:12px} .results-heading{margin:0 2px 12px} .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:12px} .result{border:1px solid var(--line);border-radius:16px;overflow:hidden;min-width:0;background:var(--panel)} .result img{width:100%;height:180px;object-fit:contain;background:var(--inset)} .result-body{padding:12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px} .wide{grid-column:1/-1} .empty{padding:14px 8px;color:var(--muted);text-align:center;font-size:12px}',
+      '.results-section{padding-top:24px;scroll-margin-top:12px} .results-heading{margin:0 2px 12px} .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,310px),1fr));gap:12px} .result{border:1px solid var(--line);border-radius:16px;overflow:hidden;min-width:0;background:var(--panel)} .result img{width:100%;height:180px;object-fit:contain;background:var(--inset)} .result--lineart img{background:var(--paper)} .lineart-note{margin:0 2px 12px;font-size:11px} .result-body{padding:12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px} .wide{grid-column:1/-1} .empty{padding:14px 8px;color:var(--muted);text-align:center;font-size:12px}',
       '.result-preview{position:relative;min-height:180px} .result-loading{position:absolute;inset:0;display:grid;place-items:center;background:color-mix(in srgb,var(--bg) 65%,transparent)} .result-progress{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--card);padding:8px;margin-bottom:8px} .spinner{width:22px;height:22px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @keyframes frame-review-spin{to{transform:rotate(360deg)}} @media(prefers-reduced-motion:reduce){.spinner{animation:none}}',
       '.status--busy{display:flex;align-items:center;gap:6px} .status--busy::before{content:"";width:12px;height:12px;flex-shrink:0;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:frame-review-spin .8s linear infinite} @media(prefers-reduced-motion:reduce){.status--busy::before{animation:none} .frame,button{transition:none}}',
       'footer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;flex-shrink:0;padding:6px 12px;border-top:1px solid var(--line);background:var(--panel);max-height:38%;overflow:auto} .footer-actions{flex:0 1 auto;justify-content:flex-end;margin-left:auto} .status{flex:1 1 220px;min-width:0;margin:0;overflow-wrap:anywhere;font-size:11px}',
@@ -205,8 +286,8 @@
       '<section class="panel workflow-page correction-panel" data-stage="correction" id="correction-panel" role="tabpanel" aria-labelledby="correction-tab" hidden><div class="section-head"><h3>镜头校正</h3><span class="eyebrow">每批最多 24 镜</span></div><div class="row shot-tools"><button data-merge>合并勾选</button><button data-none>取消勾选</button><button data-undo>撤销</button><button data-redo>重做</button></div><div data-shots class="shot-list"></div><div class="inspect-controls"><div class="section-head"><h4>逐帧检查</h4><span data-editing-shot class="eyebrow">请选择镜头</span></div><div class="row"><button data-prev>← 前帧</button><input data-cursor class="cursor-input" aria-label="定位时间码" value="0"><button data-locate>定位</button><button data-next>后帧 →</button></div><div class="row spaced"><button data-custom>当前帧作代表</button><button data-split>在当前帧拆分</button></div><div class="boundary-tools"><button data-boundary="inPoint:-1">入点 −1 帧</button><button data-boundary="inPoint:1">入点 +1 帧</button><button data-boundary="outPoint:-1">出点 −1 帧</button><button data-boundary="outPoint:1">出点 +1 帧</button></div><p data-inspect-status class="hint">选择一个镜头，检查代表帧和边界。</p></div><button class="stage-next" data-go-stage="analysis">下一步 · 拉片分析<span aria-hidden="true">→</span></button></section>',
       '<section class="panel workflow-page analysis-panel" data-stage="analysis" id="analysis-panel" role="tabpanel" aria-labelledby="analysis-tab" hidden><div class="section-head"><h3>拉片分析</h3><button class="quiet" data-go-stage="correction">返回校正 ↗</button></div><div class="batch-summary"><strong data-analysis-count class="batch-count">00</strong><div class="batch-caption">已选镜头<small>每镜分析 1 张代表帧</small></div></div><div class="analysis-grid"><label>视觉模型<select data-model></select></label><label>分析要求<textarea data-prompt rows="5"></textarea></label></div><p class="analysis-hint">依据静态画面分析。运镜与声音仅作线索，结果可继续人工复核。</p><div class="analysis-actions"><span data-analysis-summary class="analysis-summary" role="status" aria-live="polite"></span><button data-analyze class="primary">开始 AI 拉片</button><button data-extract class="quiet">仅抽帧，稍后人工填写 →</button></div></section>',
       '</div><div class="control-footer"><span>采样 → 校正 → 分析</span><button data-results-link class="quiet" hidden>查看结果 ↓</button></div></aside>',
-      '</div><section class="results-section" data-result-section data-stage="results" aria-busy="false" hidden><div class="section-head results-heading"><div class="section-title"><span class="step">04</span><h3 data-results-title tabindex="-1">拉片结果与人工复核</h3></div><button data-back-workbench class="quiet">返回工作台 ↑</button></div><div class="result-progress" data-loading hidden role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span data-loading-label></span></div><div class="results" data-results></div></section></div>',
-      '<footer><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div><div class="row footer-actions"><button data-images>生成图片节点</button><button data-shotlist class="primary">生成分镜表节点</button><button data-contact>导出联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div></footer></main>',
+      '</div><section class="results-section" data-result-section data-stage="results" aria-busy="false" hidden><div class="section-head results-heading"><div class="section-title"><span class="step">04</span><h3 data-results-title tabindex="-1">拉片结果与人工复核</h3></div><div class="row"><button data-lineart-toggle aria-pressed="false">一键转线稿</button><button data-result-export>导出原图联系表</button><button data-back-workbench class="quiet">返回工作台 ↑</button></div></div><p class="hint lineart-note" data-lineart-note hidden></p><div class="result-progress" data-loading hidden role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span data-loading-label></span></div><div class="results" data-results></div></section></div>',
+      '<footer><div class="hint status" data-status role="status" aria-live="polite">正在读取视频…</div><div class="row footer-actions"><button data-images>生成原图节点</button><button data-shotlist class="primary">生成原图分镜表节点</button><button data-contact>导出原图联系表</button><button data-json>导出 JSON</button><button data-csv>导出 CSV</button></div></footer></main>',
     ].join('');
     const el = (name) => root.querySelector('[data-' + name + ']');
     const sourceVideo = el('source-video');
@@ -313,6 +394,22 @@
         : state.busy ? state.loadingMessage || '正在处理，请稍候…' : unapplied ? '请返回采样，应用修改后的参数' : !selectedCount ? '请返回校正，勾选要分析的镜头'
         : '已选 ' + selectedCount + ' 镜 · ' + (el('model').value ? '可开始分析' : '请选择视觉模型');
       ['images', 'shotlist', 'contact', 'json', 'csv'].forEach((name) => { el(name).disabled = state.busy || !state.results.length; });
+      const hasLineArt = hasLineArtBatch(state.results, state.lineArt);
+      el('lineart-toggle').disabled = state.busy || !state.batch || !state.results.length
+        || state.results.length !== selectedCount;
+      el('lineart-toggle').textContent = hasLineArt ? state.lineArtView ? '查看原图' : '查看线稿' : '一键转线稿';
+      el('lineart-toggle').setAttribute('aria-pressed', String(state.lineArtView));
+      const output = visibleOutput(state.lineArtView);
+      el('result-export').disabled = state.busy || !state.results.length || (state.lineArtView && !hasLineArt);
+      el('result-export').textContent = output.contact;
+      el('lineart-note').hidden = !hasLineArt;
+      el('lineart-note').textContent = state.lineArtView
+        ? '正在查看线稿 · 图片节点、分镜表与联系表将使用当前线稿；联系表保存为 SVG。'
+        : '正在查看原图 · 图片节点、分镜表与联系表将使用原图，线稿仍保留在本次会话中。';
+      ['images', 'shotlist', 'contact'].forEach((name) => {
+        el(name).textContent = output[name];
+        el(name).disabled = state.busy || !state.results.length || (state.lineArtView && !hasLineArt);
+      });
       el('result-section').setAttribute('aria-busy', String(state.busy));
       el('loading').hidden = !state.busy;
       el('loading-label').textContent = state.loadingMessage;
@@ -333,6 +430,7 @@
     }
     function invalidate() {
       const hadResults = state.results.length > 0;
+      state.lineArt.clear(); state.lineArtView = false;
       state.results = []; state.batch = null; renderResults();
       if (hadResults) status('镜头已更新，请重新抽帧或分析。');
     }
@@ -464,11 +562,71 @@
       appliedSamplingSignature = samplingSignature(); controls();
       status('已生成 ' + ranges.length + ' 镜' + (ranges.length > MAX_FRAMES ? '，仅勾选前 24 镜；其余可手动选择后分批处理' : '') + '。镜头编辑支持撤销。');
     }
+    function updateLineArtView() {
+      root.querySelectorAll('[data-result-key]').forEach((card) => {
+        const original = state.results.find((result) => result.key === card.dataset.resultKey);
+        const art = state.lineArt.get(card.dataset.resultKey);
+        const image = card.querySelector('img');
+        if (!original || !image) return;
+        image.src = state.lineArtView && art ? art.dataUrl : original.previewDataUrl;
+        image.alt = original.shotId + (state.lineArtView ? ' · 本地线稿' : ' · 原图');
+        card.classList.toggle('result--lineart', state.lineArtView && Boolean(art));
+      });
+    }
+    async function toggleLineArt() {
+      assertComplete();
+      if (hasLineArtBatch(state.results, state.lineArt)) {
+        state.lineArtView = !state.lineArtView;
+      } else {
+        const batch = state.batch, frames = state.results.slice();
+        const converted = await convertLineArtBatch(frames, async (frame) => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          if (disposed || state.batch !== batch) throw new Error('线稿批次已失效');
+          return requestLineArt(frame, effect, () => !disposed && state.batch === batch);
+        }, () => !disposed && state.batch === batch, (index, count) => status('正在转线稿 ' + index + ' / ' + count + '…'));
+        state.lineArt = converted; state.lineArtView = true;
+      }
+      updateLineArtView();
+      status(state.lineArtView ? '已显示 ' + state.lineArt.size + ' 张线稿，节点、分镜表和联系表将使用当前线稿。' : '已切回原图，线稿保留在本次会话中。');
+    }
+    async function exportLineArt() {
+      assertComplete();
+      const batch = state.batch;
+      const originals = state.results.map((frame) => state.lineArt.get(frame.key));
+      if (!hasLineArtBatch(state.results, state.lineArt)) throw new Error('请先完整转换当前结果');
+      let content = lineArtSvg(originals, sourceName);
+      // PNG 嵌入 SVG 联系表；按需缩小，避免宿主静默截断文本。
+      for (const limit of [320, 240, 160]) {
+        if (content.length <= 256000) break;
+        status('正在整理线稿联系表…');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (disposed || state.batch !== batch) throw new Error('线稿批次已失效');
+        const images = [];
+        for (const image of originals) {
+          const preview = new Image(); preview.src = image.dataUrl; await preview.decode();
+          if (disposed || state.batch !== batch) throw new Error('线稿批次已失效');
+          const scale = Math.min(1, limit / Math.max(image.width, image.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(image.width * scale));
+          canvas.height = Math.max(1, Math.round(image.height * scale));
+          const context = canvas.getContext('2d');
+          if (!context) throw new Error('当前环境不支持线稿导出');
+          context.drawImage(preview, 0, 0, canvas.width, canvas.height);
+          images.push({ dataUrl: canvas.toDataURL('image/png'), actualTime: image.actualTime });
+        }
+        content = lineArtSvg(images, sourceName);
+      }
+      if (disposed || state.batch !== batch) throw new Error('线稿批次已失效');
+      const saved = await effect({ type: 'resource.createText', content: checkedLineArtSvg(content), suggestedName: 'frame-review-lineart.svg' });
+      status('线稿联系表已保存到项目：' + saved.fileName);
+    }
+
     function renderResults() {
       el('results').replaceChildren();
       if (!state.results.length) { el('results').appendChild(element('div', 'empty', '选择镜头，抽帧后可 AI 分析或人工填写')); controls(); return; }
       state.results.forEach((result) => {
         const card = element('article', 'result'), body = element('div', 'result-body'), image = element('img');
+        card.dataset.resultKey = result.key;
         image.src = result.previewDataUrl; image.alt = result.shotId;
         const badge = element('div', 'hint wide');
         const updateBadge = () => { badge.textContent = result.shotId + ' · ' + formatTimecode(result.actualTime)
@@ -500,7 +658,7 @@
         overlay.appendChild(element('span', 'spinner')); preview.append(image, overlay);
         body.appendChild(actions); card.append(preview, body); el('results').appendChild(card);
       });
-      controls();
+      updateLineArtView(); controls();
     }
     async function prepareFrames() {
       const shots = state.shots.filter((s) => s.selected);
@@ -510,6 +668,7 @@
       status('正在批量抽帧…');
       const value = await effect({ type: 'video.extractFrames', resourceId: videoResource.resourceId, mode: 'analysis', replaceDerived: true,
         samples: shots.map((s) => ({ key: s.id, time: sampleTime(s) })) });
+      state.lineArt.clear(); state.lineArtView = false;
       state.batch = { signature, value };
       state.results = shots.flatMap((shot) => {
         const frame = value.frames.find((f) => f.key === shot.id);
@@ -551,7 +710,7 @@
     function report() {
       assertComplete();
       return { schemaVersion: 1, source: { nodeId: props.node.id, name: sourceName, duration: state.video.duration },
-        sampling: state.sampling, frames: state.results.map(publicFrame) };
+        sampling: state.sampling, imageRepresentation: visibleOutput(state.lineArtView).imageRepresentation, frames: state.results.map(publicFrame) };
     }
     async function exportReport(kind) {
       const data = report();
@@ -562,10 +721,17 @@
     }
     async function submit(outputMode) {
       assertComplete();
-      if (state.results.some((r) => r.analysisError || r.reviewStatus === 'edited')) throw new Error('请先确认缺失结果和人工修改的复核状态');
+      // Capture one visible representation for the whole batch; never submit preview bytes.
+      const parameters = buildSubmission(outputMode, state.video.duration, state.results, state.lineArtView, state.lineArt);
       status(outputMode === 'images' ? '正在保存画面并生成图片节点…' : '正在保存画面并生成分镜表节点…');
-      await props.submit({ outputMode, videoDuration: state.video.duration,
-        frames: state.results.map((r) => ({ ...publicFrame(r), resourceId: r.resourceId, width: r.width, height: r.height })) });
+      await props.submit(parameters);
+    }
+    async function exportContact() {
+      assertComplete();
+      if (state.lineArtView) return exportLineArt();
+      const id = state.batch.value.contactSheetResourceId; if (!id) throw new Error('没有联系表资源');
+      const saved = await effect({ type: 'resource.export', resourceId: id, suggestedName: 'frame-review-contact.jpg' });
+      status('原图联系表已保存到项目：' + saved.fileName);
     }
     const models = (props.models || []).filter((m) => m.category === 'text' && (m.inputModalities || []).includes('image'));
     const placeholder = element('option', '', '选择视觉模型'); placeholder.value = ''; el('model').appendChild(placeholder);
@@ -616,14 +782,11 @@
       const next = moveBoundary(state.shots, state.shots.indexOf(shot), edge, frame.boundaryTime ?? frame.actualTime);
       commitShots(next); status('边界已按实际帧移动；相邻镜头同步调整。');
     })));
+    listen('lineart-toggle', toggleLineArt, '正在准备本地线稿…');
+    listen('result-export', exportContact, '正在导出当前联系表…');
     listen('images', () => submit('images'), '正在生成图片节点…'); listen('shotlist', () => submit('shotlist'), '正在生成分镜表节点…');
     listen('json', () => exportReport('json')); listen('csv', () => exportReport('csv'));
-    listen('contact', async () => {
-      assertComplete();
-      const id = state.batch.value.contactSheetResourceId; if (!id) throw new Error('没有联系表资源');
-      const saved = await effect({ type: 'resource.export', resourceId: id, suggestedName: 'frame-review-contact.jpg' });
-      status('已保存到项目：' + saved.fileName);
-    });
+    listen('contact', exportContact, '正在导出当前联系表…');
     const strip = el('filmstrip');
     el('view').addEventListener('click', () => {
       if (state.busy) return;
@@ -660,7 +823,7 @@
       await loadSourceVideo();
     });
     return function cleanup() {
-      disposed = true; window.removeEventListener('ai-canvas-theme-change', themeListener);
+      disposed = true; state.lineArt.clear(); state.results = []; state.batch = null; window.removeEventListener('ai-canvas-theme-change', themeListener);
       sourceVideo.pause(); sourceVideo.removeAttribute('src'); sourceVideo.load();
       if (sourceVideoUrl) { URL.revokeObjectURL(sourceVideoUrl); sourceVideoUrl = ''; }
       root.replaceChildren();

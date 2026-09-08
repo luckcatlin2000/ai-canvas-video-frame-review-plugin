@@ -93,14 +93,21 @@ function normalizeFrames(parameters) {
 
 function buildNodeSet(parameters) {
   if (!Number.isFinite(parameters.videoDuration) || parameters.videoDuration <= 0) throw new Error('来源视频时长无效');
+  const imageRepresentation = parameters.imageRepresentation === undefined ? 'original' : parameters.imageRepresentation;
+  if (!['original', 'lineart'].includes(imageRepresentation)) throw new Error('画面表示无效，必须为原图或线稿');
+  if (imageRepresentation === 'lineart' && (!Array.isArray(parameters.frames) || parameters.frames.some((frame) => !frame
+    || ![frame.width, frame.height].every((value) => Number.isSafeInteger(value) && value > 0 && value <= 1024)))) {
+    throw new Error('线稿图片尺寸无效，请重新转换当前批次');
+  }
   const frames = normalizeFrames(parameters);
   const outputMode = parameters.outputMode === 'images' ? 'images' : 'shotlist';
   const imageNodes = frames.map((frame) => ({
     key: frame.key,
     nodeType: 'ai-image',
     resourceId: frame.resourceId,
+    representation: imageRepresentation,
     data: {
-      label: `${formatTimecode(frame.actualTime)} · ${frame.shotSize}`,
+      label: `${formatTimecode(frame.actualTime)} · ${frame.shotSize}${imageRepresentation === 'lineart' ? ' · 线稿' : ''}`,
       imageWidth: frame.width,
       imageHeight: frame.height,
       frameAnalysis: {
@@ -151,7 +158,7 @@ function buildNodeSet(parameters) {
         key: shotlistKey,
         nodeType: 'ai-shotlist',
         data: {
-          label: `逐帧拉片 · ${frames.length} 镜`,
+          label: `逐帧拉片${imageRepresentation === 'lineart' ? ' · 线稿' : ''} · ${frames.length} 镜`,
           shotlistRows,
         },
       },
@@ -165,8 +172,8 @@ definePlugin({
     'video-frame-review': (input) => ({
       data: buildNodeSet(input && input.parameters ? input.parameters : {}),
       message: input && input.parameters && input.parameters.outputMode === 'images'
-        ? '已生成逐帧图片节点'
-        : '已生成逐帧图片与分镜表',
+        ? (input.parameters.imageRepresentation === 'lineart' ? '已生成逐帧线稿节点' : '已生成逐帧原图节点')
+        : (input && input.parameters && input.parameters.imageRepresentation === 'lineart' ? '已生成逐帧线稿与分镜表' : '已生成逐帧原图与分镜表'),
     }),
   },
 });

@@ -35,8 +35,10 @@ assert.equal(packageJson.dependencies, undefined, '首版不得引入运行时�
 assert.equal(packageJson.devDependencies, undefined, '首版不得引入开发依赖');
 
 for (const [name, source] of [['main.js', mainSource], ['ui.js', uiSource]]) {
-  assert.doesNotMatch(source, /[A-Za-z]:[\\/]/, `${name} 包含 Windows 绝对路径`);
-  assert.doesNotMatch(source, /https?:\/\//i, `${name} 不应直接联网`);
+  const executableSource = source.replaceAll('xmlns="http://www.w3.org/2000/svg"', '');
+  assert.doesNotMatch(executableSource, /[A-Za-z]:[\\/]/, `${name} 包含 Windows 绝对路径`);
+  // SVG 命名空间只是导出文档的标识，不发起网络请求。
+  assert.doesNotMatch(executableSource, /https?:\/\//i, `${name} 不应直接联网`);
 }
 
 console.log('发布结构、权限、版本与 UI integrity 校验通过');

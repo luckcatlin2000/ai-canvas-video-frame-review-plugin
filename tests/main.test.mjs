@@ -90,3 +90,31 @@ test('拒绝越界、重叠区间和未确认的人工修改', () => {
   assert.throws(() => run([frame('s1', 0), frame('s2', 1)]), /重叠/);
   assert.throws(() => run([{ ...frame('s1', 0), reviewStatus: 'edited' }]), /复核/);
 });
+
+test('线稿节点和分镜保留来源资源与 frameKey，并使用宿主线稿的真实尺寸', () => {
+  const frames = [frame('line-01', 0), frame('line-02', 2)].map(value => ({ ...value, width: 1024, height: 576 }));
+  const result = plugin.tools['video-frame-review']({ parameters: { imageRepresentation: 'lineart', outputMode: 'shotlist', videoDuration: 8, frames } });
+  const images = result.data.nodes.filter(node => node.nodeType === 'ai-image');
+  const shotlist = result.data.nodes.find(node => node.nodeType === 'ai-shotlist');
+  assert.equal(images.length, 2);
+  images.forEach((node, index) => {
+    assert.equal(node.resourceId, frames[index].resourceId); assert.equal(node.representation, 'lineart');
+    assert.equal(node.data.imageWidth, 1024); assert.equal(node.data.imageHeight, 576);
+    assert.match(node.data.label, /线稿/); assert.equal(shotlist.data.shotlistRows[index].frameKey, node.key);
+    assert.deepEqual(shotlist.data.shotlistRows[index].frameAnalysis, node.data.frameAnalysis);
+  });
+  assert.match(shotlist.data.label, /线稿/); assert.match(result.message, /线稿/);
+  assert.doesNotMatch(JSON.stringify(result), /data:image|previewDataUrl/);
+});
+
+test('默认及显式原图模式保留原图，未知表示和错误线稿尺寸均拒绝而非回退', () => {
+  const run = (patch) => plugin.tools['video-frame-review']({ parameters: { outputMode: 'images', videoDuration: 8, frames: [frame('s1', 0)], ...patch } });
+  for (const patch of [{}, { imageRepresentation: 'original' }]) {
+    const result = run(patch);
+    assert.equal(result.data.nodes[0].representation, 'original'); assert.equal(result.data.nodes[0].data.imageWidth, 1280);
+  }
+  for (const imageRepresentation of ['', null, 'sketch', 0]) assert.throws(() => run({ imageRepresentation }), /画面表示无效/);
+  for (const dimensions of [{ width: 1025, height: 576 }, { width: 0, height: 1 }, { width: 1.5, height: 1 }, { width: 1, height: NaN }]) {
+    assert.throws(() => run({ imageRepresentation: 'lineart', frames: [{ ...frame('s1', 0), ...dimensions }] }), /线稿图片尺寸无效/);
+  }
+});
