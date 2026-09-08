@@ -3,7 +3,7 @@
   "runtime": "javascript",
   "id": "com.ai-canvas.video-frame-review",
   "name": "逐帧拉片",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "AI-Canvas Contributors",
   "description": "从当前视频节点选择时间点，批量抽帧并用视觉模型生成可编辑的分镜表或图片节点。",
   "license": "MIT",
